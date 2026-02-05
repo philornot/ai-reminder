@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/ai-reminder
-ExecStart=/usr/bin/python3 /home/pi/ai-reminder/main.py
+ExecStart=/home/pi/ai-reminder/.venv/bin/python3 /home/pi/ai-reminder/main.py
 Restart=always
 RestartSec=10
 
