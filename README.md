@@ -120,25 +120,6 @@ sudo systemctl status ai-reminder
 sudo journalctl -u ai-reminder -f
 ```
 
-## Directory Structure
-
-```
-ai-reminder/
-├── config/
-│   └── config.yaml          # Main configuration
-├── logs/                    # Application logs
-├── cache/                   # Cached AI messages
-├── main.py                  # Main application
-├── config_loader.py         # Configuration loader
-├── logger.py                # Custom logging
-├── discord_webhook.py       # Discord integration
-├── llm_client.py           # LLM API client
-├── cache_manager.py        # Message cache manager
-├── scheduler.py            # Reminder scheduler
-├── requirements.txt        # Python dependencies
-└── ai-reminder.service     # Systemd service file
-```
-
 ## Debug Webhook Levels
 
 Configure `discord.debug_level` in config.yaml:
