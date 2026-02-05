@@ -20,20 +20,6 @@ Automated reminder system that uses AI to generate creative messages and sends t
 - **Google Gemini** (gemini-pro, gemini-1.5-flash) - Free tier available
 - **Groq** (llama-3.1-70b-versatile, mixtral-8x7b-32768) - Free tier available
 
-## Installation
-
-1. Clone or copy this directory to your Raspberry Pi:
-```bash
-cd /home/pi
-git clone <your-repo> ai-reminder
-cd ai-reminder
-```
-
-2. Run the installation script:
-```bash
-./install.sh
-```
-
 ## Configuration
 
 Edit `config/config.yaml` and configure:
