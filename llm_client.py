@@ -1,10 +1,9 @@
 """LLM client for generating reminder messages."""
 
-import openai
-from typing import Optional
 import logging
+from typing import Optional
+
 import requests
-import json
 
 
 class LLMClient:
@@ -68,11 +67,12 @@ class LLMClient:
         if self.provider == 'gemini':
             self._init_gemini_client()
         else:
-            # OpenAI and Groq use OpenAI-compatible API
+            # OpenAI and Groq use OpenAI-compatible API - lazy import
             self._init_openai_compatible_client()
 
     def _init_openai_compatible_client(self):
         """Initialize OpenAI-compatible client (OpenAI, Groq)."""
+        import openai
         self.client = openai.OpenAI(
             api_key=self.api_key,
             base_url=self.base_url
@@ -113,6 +113,8 @@ class LLMClient:
         Returns:
             Generated message
         """
+        import openai
+
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
