@@ -188,7 +188,7 @@ class ReminderApp:
             # Schedule first reminder
             self.scheduler.schedule_next_reminder()
 
-            self.logger.info("Application running. Press Ctrl+C to stop.")
+            self.logger.info("Application running.")
 
             # Main loop
             while True:
