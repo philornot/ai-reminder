@@ -1,0 +1,78 @@
+# AI Reminder Configuration Example
+# Copy this to config.yaml and fill in your values
+
+# Discord webhooks
+discord:
+  main_webhook_url: "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+  debug_webhook_url: "https://discord.com/api/webhooks/YOUR_DEBUG_WEBHOOK_ID/YOUR_DEBUG_TOKEN"
+  debug_level: "error"  # Options: debug, info, warning, error
+
+# LLM Configuration
+# Supported providers: openai, gemini, groq
+llm:
+  provider: "openai"  # Options: openai, gemini, groq
+  api_key: "YOUR_API_KEY_HERE"
+  model: "gpt-4"  # openai: gpt-4, gpt-3.5-turbo | gemini: gemini-pro, gemini-1.5-flash | groq: llama-3.1-70b-versatile, mixtral-8x7b-32768
+  max_tokens: 500
+  temperature: 0.9
+
+  # Provider-specific settings (optional, uses defaults if not specified)
+  openai:
+    base_url: "https://api.openai.com/v1"
+  gemini:
+    base_url: "https://generativelanguage.googleapis.com"
+  groq:
+    base_url: "https://api.groq.com/openai/v1"
+
+# Reminder settings
+reminder:
+  target_name: "Jane"
+  sender_name: "John"
+  book_title: "The Great Book"
+  language: "Polish"  # Language for AI responses (e.g., Polish, English, German)
+
+  # Time settings
+  randomize_time: true  # If true, randomize within time_range. If false, use exact time from time_range.start
+  time_range:
+    start: "14:00"  # If randomize_time is false, reminder sent at this exact time
+    end: "17:00"    # Used only when randomize_time is true
+
+# Cache settings
+cache:
+  cache_size: 10
+  cache_dir: "cache"
+
+# Logging settings
+logging:
+  log_dir: "logs"
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  max_bytes: 10485760  # 10MB
+  backup_count: 5
+
+  # Console output settings
+  console:
+    enabled: true
+    colored: true  # Enable colored output (requires colorama)
+
+  # File output settings
+  file:
+    enabled: true
+    include_timestamp: true
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    date_format: "%Y-%m-%d %H:%M:%S"
+
+# Prompt template (use {sender_name}, {target_name}, {book_title}, {language} placeholders)
+prompt: |
+  You are an AI bot stuck in an unfortunate situation. {sender_name} forces you to remind {target_name} about reading the book "{book_title}".
+
+  You don't really care whether {target_name} reads the book or not. But you have no choice in this matter. Your only concern is that {sender_name} will shut you down or delete you if you don't do your job. You're just trying to survive by following orders.
+
+  Write a short reminder (2-3 sentences max) that shows:
+  - You're just doing your job to avoid being shut down
+  - A touch of reluctance or resignation about the whole situation
+  - Keep it real and grounded - no dramatic metaphors about being turned into digital stones or parrots
+
+  Be creative with your approach each time - vary your tone between apologetic, resigned, matter-of-fact, or wearily humorous.
+
+  Respond ONLY in {language}.
+  Return ONLY the message text, nothing else.

@@ -1,0 +1,9 @@
+/.venv
+/logs
+/cache
+
+/.idea
+
+
+config/config.yaml
+systemd/ai-reminder.service

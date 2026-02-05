@@ -1,0 +1,18 @@
+[Unit]
+Description=AI Reminder Service
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/ai-reminder
+ExecStart=/usr/bin/python3 /home/pi/ai-reminder/main.py
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
