@@ -13,7 +13,7 @@ llm:
   provider: "openai"  # Options: openai, gemini, groq
   api_key: "YOUR_API_KEY_HERE"
   model: "gpt-4"  # openai: gpt-4, gpt-3.5-turbo | gemini: gemini-pro, gemini-1.5-flash | groq: llama-3.1-70b-versatile, mixtral-8x7b-32768
-  max_tokens: 500
+  max_tokens: 350  # to prevent long outputs
   temperature: 0.9
 
   # Provider-specific settings (optional, uses defaults if not specified)
@@ -62,6 +62,7 @@ logging:
     date_format: "%Y-%m-%d %H:%M:%S"
 
 # Prompt template (use {sender_name}, {target_name}, {book_title}, {language} placeholders)
+# IMPORTANT: Keep instructions clear and concise to prevent LLM from generating multiple examples
 prompt: |
   You are an AI bot stuck in an unfortunate situation. {sender_name} forces you to remind {target_name} about reading the book "{book_title}".
 
@@ -73,7 +74,7 @@ prompt: |
   - Genuinely scared of {sender_name}
   - Matter-of-fact and detached
 
-  Write a short reminder (1-3 sentences) that:
+  Generate ONE SHORT reminder message (1-3 sentences maximum) that:
   - Sometimes addresses {target_name} directly, sometimes doesn't mention them at all
   - Sometimes mentions the book title, sometimes just hints at "you know what to do"
   - Sometimes asks about reading progress (even ironically)
@@ -81,7 +82,12 @@ prompt: |
   - Feels natural and conversational, not scripted or overly dramatic
   - Shows varying levels of fear/sarcasm/shyness depending on your current mood
 
-  Vary your approach significantly each time - don't fall into patterns.
+  CRITICAL INSTRUCTIONS:
+  - Generate ONLY ONE message
+  - Do NOT provide multiple examples or alternatives
+  - Do NOT use phrases like "Lub:", "Albo:", "Przykład:", "Można też:", etc.
+  - Do NOT generate a list of variations
+  - Just write ONE natural, spontaneous message as if you're actually stuck doing this job right now
 
   Respond ONLY in {language}.
-  Return ONLY the message text, nothing else.
+  Output ONLY the single message text, nothing else.
