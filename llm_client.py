@@ -1,6 +1,7 @@
 """LLM client for generating reminder messages."""
 
 import logging
+import re
 from typing import Optional
 
 import requests
@@ -83,6 +84,99 @@ class LLMClient:
         # Gemini uses a different API structure, we'll handle it separately
         self.client = None
 
+    def _clean_message(self, raw_message: str) -> Optional[str]:
+        """Clean and validate LLM output.
+
+        Some models tend to generate multiple examples or add extra formatting.
+        This method extracts only the actual reminder message.
+
+        Args:
+            raw_message: Raw output from LLM
+
+        Returns:
+            Cleaned message or None if invalid
+        """
+        if not raw_message:
+            return None
+
+        # Remove leading/trailing whitespace
+        message = raw_message.strip()
+
+        # Log original for debugging
+        if len(message) > 200:
+            self.logger.warning(f"LLM returned long message ({len(message)} chars), attempting cleanup")
+            self.logger.debug(f"Original message: {message}")
+
+        # Patterns that indicate the LLM is generating examples/alternatives
+        example_patterns = [
+            r'Lub:',
+            r'Albo:',
+            r'Lub tak:',
+            r'Przykład:',
+            r'Przykładowe',
+            r'Może:',
+            r'I jeszcze:',
+            r'Następnie:',
+            r'Lub też:',
+            r'Ewentualnie:',
+            r'Wersja \d+:',
+            r'Opcja \d+:',
+        ]
+
+        # Check if message contains example indicators
+        has_examples = any(re.search(pattern, message, re.IGNORECASE) for pattern in example_patterns)
+
+        if has_examples:
+            self.logger.warning("Message contains example indicators, extracting first variant")
+
+            # Split by common separators and take first part
+            separators = ['\n\nLub:', '\n\nAlbo:', '\n\nMoże:', '\n\nPrzykład:',
+                         '\nLub:', '\nAlbo:', '\nMoże:', '\nNastępnie:', '\nI jeszcze:',
+                         '\n\nLub tak:', '\nLub też:', '\nEwentualnie:']
+
+            for separator in separators:
+                if separator in message:
+                    parts = message.split(separator)
+                    message = parts[0].strip()
+                    self.logger.info(f"Extracted first variant, reduced from {len(raw_message)} to {len(message)} chars")
+                    break
+
+        # Remove markdown formatting if present
+        message = re.sub(r'\*\*(.+?)\*\*', r'\1', message)  # Bold
+        message = re.sub(r'\*(.+?)\*', r'\1', message)      # Italic
+        message = re.sub(r'`(.+?)`', r'\1', message)        # Code
+
+        # Remove leading numbers/bullets (1., -, *, etc.)
+        message = re.sub(r'^[\d\-\*\•]+[\.\)]\s*', '', message)
+
+        # Final cleanup
+        message = message.strip()
+
+        # Validate length - reminder should be reasonably short
+        if len(message) > 500:
+            self.logger.warning(f"Message still too long after cleanup ({len(message)} chars), taking first sentence")
+            # Take first 1-2 sentences
+            sentences = re.split(r'[.!?]+\s+', message)
+            if sentences:
+                # Take first sentence, or first two if first is very short
+                if len(sentences[0]) < 50 and len(sentences) > 1:
+                    message = sentences[0] + '. ' + sentences[1] + '.'
+                else:
+                    message = sentences[0] + ('.' if not sentences[0].endswith(('.', '!', '?')) else '')
+                message = message.strip()
+
+        # Validate not empty
+        if not message or len(message) < 10:
+            self.logger.error(f"Message too short after cleanup: '{message}'")
+            return None
+
+        # Log if we made significant changes
+        if len(message) < len(raw_message) * 0.5:
+            self.logger.info(f"Significantly reduced message length: {len(raw_message)} → {len(message)} chars")
+            self.logger.debug(f"Cleaned message: {message}")
+
+        return message
+
     def generate_message(self, prompt: str) -> Optional[str]:
         """Generate a reminder message using LLM.
 
@@ -96,9 +190,22 @@ class LLMClient:
             self.logger.debug(f"Sending prompt to LLM (provider: {self.provider}, model: {self.model})")
 
             if self.provider == 'gemini':
-                return self._generate_gemini(prompt)
+                raw_message = self._generate_gemini(prompt)
             else:
-                return self._generate_openai_compatible(prompt)
+                raw_message = self._generate_openai_compatible(prompt)
+
+            if not raw_message:
+                return None
+
+            # Clean and validate the message
+            cleaned_message = self._clean_message(raw_message)
+
+            if not cleaned_message:
+                self.logger.error("Message cleanup failed, rejecting output")
+                return None
+
+            self.logger.info(f"Successfully generated message ({len(cleaned_message)} chars)")
+            return cleaned_message
 
         except Exception as e:
             self.logger.error(f"Error generating message: {e}")
@@ -126,8 +233,7 @@ class LLMClient:
             )
 
             message = response.choices[0].message.content.strip()
-            self.logger.info("Successfully generated message from LLM")
-            self.logger.debug(f"Generated message: {message}")
+            self.logger.debug(f"Raw LLM response: {message[:200]}..." if len(message) > 200 else f"Raw LLM response: {message}")
 
             return message
 
@@ -191,8 +297,7 @@ class LLMClient:
                 candidate = result['candidates'][0]
                 if 'content' in candidate and 'parts' in candidate['content']:
                     message = candidate['content']['parts'][0]['text'].strip()
-                    self.logger.info("Successfully generated message from Gemini")
-                    self.logger.debug(f"Generated message: {message}")
+                    self.logger.debug(f"Raw LLM response: {message[:200]}..." if len(message) > 200 else f"Raw LLM response: {message}")
                     return message
 
             self.logger.error("Unexpected Gemini API response structure")
