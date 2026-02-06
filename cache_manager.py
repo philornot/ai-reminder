@@ -1,10 +1,10 @@
 """Cache manager for AI-generated messages."""
 
 import json
-from pathlib import Path
-from typing import Optional, List
 import logging
 from datetime import datetime
+from pathlib import Path
+from typing import Optional, List
 
 
 class CacheManager:
@@ -40,14 +40,49 @@ class CacheManager:
             self.logger.info("Created new cache file")
 
     def _read_cache(self) -> List[dict]:
-        """Read cache from file.
+        """Read cache from file with validation.
 
         Returns:
             List of cached message entries
         """
         try:
             with open(self.cache_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                cache = json.load(f)
+
+                # Validate cache structure
+                if not isinstance(cache, list):
+                    self.logger.error(f"Invalid cache structure: expected list, got {type(cache)}")
+                    return []
+
+                # Validate each entry
+                valid_cache = []
+                for i, entry in enumerate(cache):
+                    if not isinstance(entry, dict):
+                        self.logger.warning(f"Skipping invalid entry at index {i}: not a dict")
+                        continue
+
+                    if "message" not in entry:
+                        self.logger.warning(f"Skipping invalid entry at index {i}: missing 'message' key")
+                        continue
+
+                    if not isinstance(entry["message"], str):
+                        self.logger.warning(f"Skipping invalid entry at index {i}: 'message' is not a string")
+                        continue
+
+                    # Additional check: message should not be empty
+                    if not entry["message"].strip():
+                        self.logger.warning(f"Skipping invalid entry at index {i}: empty message")
+                        continue
+
+                    valid_cache.append(entry)
+
+                if len(valid_cache) < len(cache):
+                    self.logger.warning(f"Removed {len(cache) - len(valid_cache)} invalid entries from cache")
+                    # Save cleaned cache
+                    self._write_cache(valid_cache)
+
+                return valid_cache
+
         except (json.JSONDecodeError, FileNotFoundError) as e:
             self.logger.error(f"Error reading cache: {e}")
             return []
@@ -75,6 +110,16 @@ class CacheManager:
             True if successful, False otherwise
         """
         try:
+            # Validate message
+            if not message or not isinstance(message, str):
+                self.logger.error(f"Invalid message: must be non-empty string")
+                return False
+
+            message = message.strip()
+            if not message:
+                self.logger.error(f"Invalid message: empty after stripping")
+                return False
+
             cache = self._read_cache()
 
             entry = {
@@ -109,10 +154,31 @@ class CacheManager:
             oldest = cache.pop(0)
             message = oldest["message"]
 
+            # Validate message before returning
+            if not message or not isinstance(message, str):
+                self.logger.error(f"Retrieved invalid message from cache: {type(message)}")
+                # Try to get next message
+                self._write_cache(cache)
+                if cache:
+                    return self.get_oldest_message()
+                return None
+
+            message = message.strip()
+            if not message:
+                self.logger.error(f"Retrieved empty message from cache")
+                # Try to get next message
+                self._write_cache(cache)
+                if cache:
+                    return self.get_oldest_message()
+                return None
+
             # Write updated cache
             self._write_cache(cache)
 
             self.logger.info(f"Retrieved oldest message from cache (remaining: {len(cache)})")
+            self.logger.debug(
+                f"Message content: {message[:50]}..." if len(message) > 50 else f"Message content: {message}")
+
             return message
 
         except Exception as e:
@@ -150,3 +216,36 @@ class CacheManager:
         """Clear all cached messages."""
         self._write_cache([])
         self.logger.info("Cache cleared")
+
+    def validate_and_repair_cache(self) -> bool:
+        """Validate cache file and repair if needed.
+
+        Returns:
+            True if cache is valid or was repaired successfully
+        """
+        try:
+            cache = self._read_cache()
+
+            # Check for duplicates
+            seen_messages = set()
+            unique_cache = []
+            duplicates = 0
+
+            for entry in cache:
+                msg = entry.get("message", "").strip()
+                if msg and msg not in seen_messages:
+                    seen_messages.add(msg)
+                    unique_cache.append(entry)
+                else:
+                    duplicates += 1
+
+            if duplicates > 0:
+                self.logger.warning(f"Removed {duplicates} duplicate messages from cache")
+                self._write_cache(unique_cache)
+
+            self.logger.info(f"Cache validation complete: {len(unique_cache)} valid unique messages")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Cache validation failed: {e}")
+            return False

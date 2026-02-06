@@ -1,16 +1,14 @@
 """Main reminder application."""
 
-import time
 import sys
-from pathlib import Path
+import time
 from typing import Optional
-import logging
 
+from cache_manager import CacheManager
 from config_loader import Config
-from logger import setup_logger
 from discord_webhook import DiscordWebhook
 from llm_client import LLMClient
-from cache_manager import CacheManager
+from logger import setup_logger
 from scheduler import ReminderScheduler
 
 
@@ -35,6 +33,9 @@ class ReminderApp:
         self.logger.info("=" * 60)
         self.logger.info("AI Reminder Application Starting")
         self.logger.info("=" * 60)
+
+        # Flag to prevent multiple simultaneous sends
+        self._is_sending = False
 
         # Initialize components
         self._initialize_components()
@@ -105,6 +106,10 @@ class ReminderApp:
 
     def _initialize_cache(self):
         """Fill cache with initial messages."""
+        # First validate and repair existing cache
+        self.logger.info("Validating existing cache...")
+        self.cache.validate_and_repair_cache()
+
         needed = self.cache.needs_refill()
 
         if needed == 0:
@@ -138,7 +143,16 @@ class ReminderApp:
         Returns:
             True if successful, False otherwise
         """
+        # Prevent multiple simultaneous sends
+        if self._is_sending:
+            self.logger.warning("Already sending a reminder, skipping duplicate send attempt")
+            return False
+
         try:
+            self._is_sending = True
+            self.logger.info("=" * 60)
+            self.logger.info("Starting reminder send process")
+
             # Get message from cache
             message = self.cache.get_oldest_message()
 
@@ -147,24 +161,38 @@ class ReminderApp:
                 self.webhook.send_error("Cache is empty, cannot send reminder")
                 return False
 
+            # Validate message one more time
+            if not isinstance(message, str) or not message.strip():
+                self.logger.error(f"Invalid message retrieved: {type(message)}")
+                self.webhook.send_error("Invalid message format in cache")
+                return False
+
+            message = message.strip()
+            self.logger.info(
+                f"Sending message: {message[:100]}..." if len(message) > 100 else f"Sending message: {message}")
+
             # Send to Discord
             success = self.webhook.send_reminder(message)
 
             if success:
-                self.logger.info("Reminder sent successfully")
+                self.logger.info("✓ Reminder sent successfully")
                 # Refill cache asynchronously
                 self._refill_cache()
             else:
-                self.logger.error("Failed to send reminder to Discord")
+                self.logger.error("✗ Failed to send reminder to Discord")
                 # Put message back in cache
+                self.logger.info("Re-adding message to cache")
                 self.cache.add_message(message)
 
+            self.logger.info("=" * 60)
             return success
 
         except Exception as e:
             self.logger.error(f"Error sending reminder: {e}")
             self.webhook.send_error("Error sending reminder", e)
             return False
+        finally:
+            self._is_sending = False
 
     def _refill_cache(self):
         """Refill cache with one new message if needed."""
@@ -188,12 +216,14 @@ class ReminderApp:
             # Schedule first reminder
             self.scheduler.schedule_next_reminder()
 
-            self.logger.info("Application running.")
+            self.logger.info("Application running. Press Ctrl+C to stop.")
 
             # Main loop
             while True:
                 if self.scheduler.should_send_reminder():
+                    self.logger.debug("Scheduler indicates it's time to send reminder")
                     self._send_reminder()
+                    self.logger.debug("Scheduling next reminder")
                     self.scheduler.schedule_next_reminder()
 
                 # Wait before next check
@@ -201,10 +231,10 @@ class ReminderApp:
                 time.sleep(interval)
 
         except KeyboardInterrupt:
-            self.logger.info("Application stopped by user")
+            self.logger.info("\nApplication stopped by user")
             sys.exit(0)
         except Exception as e:
-            self.logger.error(f"Application error: {e}")
+            self.logger.error(f"Application error: {e}", exc_info=True)
             self.webhook.send_error("Application crashed", e)
             raise
 
