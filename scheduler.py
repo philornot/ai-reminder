@@ -1,10 +1,9 @@
 """Scheduler for managing reminder timing."""
 
+import logging
 import random
 from datetime import datetime, time, timedelta
-import time as time_module
 from typing import Optional
-import logging
 
 
 class ReminderScheduler:
@@ -33,6 +32,7 @@ class ReminderScheduler:
         self.range_end = self._parse_time(time_range_end) if randomize else self.range_start
 
         self.next_reminder_time: Optional[datetime] = None
+        self._reminder_sent_today = False  # Flag to prevent double sending
 
         if randomize:
             self.logger.info(f"Scheduler initialized with random time between {time_range_start} and {time_range_end}")
@@ -105,7 +105,7 @@ class ReminderScheduler:
         # Check if we can schedule for today
         now = datetime.now()
 
-        if now < today_reminder:
+        if now < today_reminder and not self._reminder_sent_today:
             self.next_reminder_time = today_reminder
         else:
             # Schedule for tomorrow
@@ -114,11 +114,17 @@ class ReminderScheduler:
             else:
                 self.next_reminder_time = self._generate_fixed_time(tomorrow)
 
+            # Reset daily flag when scheduling for tomorrow
+            self._reminder_sent_today = False
+
         self.logger.info(f"Next reminder scheduled for: {self.next_reminder_time.strftime('%Y-%m-%d %H:%M:%S')}")
         return self.next_reminder_time
 
     def should_send_reminder(self) -> bool:
         """Check if it's time to send a reminder.
+
+        This method now resets the reminder time immediately when it's time to send,
+        preventing duplicate sends within the same check interval.
 
         Returns:
             True if reminder should be sent now
@@ -131,7 +137,20 @@ class ReminderScheduler:
         now = datetime.now()
 
         if now >= self.next_reminder_time:
+            # Check if we already sent today
+            if self._reminder_sent_today:
+                self.logger.debug("Reminder already sent today, skipping")
+                return False
+
             self.logger.info("Time to send reminder")
+
+            # CRITICAL FIX: Reset next_reminder_time immediately to prevent double send
+            # Set to far future temporarily to prevent re-triggering
+            self.next_reminder_time = now + timedelta(days=1)
+
+            # Mark as sent today
+            self._reminder_sent_today = True
+
             return True
 
         return False
@@ -166,6 +185,6 @@ class ReminderScheduler:
         # If more than 10 minutes away, check every minute
         elif seconds_until > 600:
             return 60
-        # If close, check every 10 seconds
+        # If close, check every 30 seconds (changed from 10 to reduce double-send risk)
         else:
-            return 10
+            return 30
