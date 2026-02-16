@@ -131,20 +131,21 @@ class LLMClient:
 
             # Split by common separators and take first part
             separators = ['\n\nLub:', '\n\nAlbo:', '\n\nMoże:', '\n\nPrzykład:',
-                         '\nLub:', '\nAlbo:', '\nMoże:', '\nNastępnie:', '\nI jeszcze:',
-                         '\n\nLub tak:', '\nLub też:', '\nEwentualnie:']
+                          '\nLub:', '\nAlbo:', '\nMoże:', '\nNastępnie:', '\nI jeszcze:',
+                          '\n\nLub tak:', '\nLub też:', '\nEwentualnie:']
 
             for separator in separators:
                 if separator in message:
                     parts = message.split(separator)
                     message = parts[0].strip()
-                    self.logger.info(f"Extracted first variant, reduced from {len(raw_message)} to {len(message)} chars")
+                    self.logger.info(
+                        f"Extracted first variant, reduced from {len(raw_message)} to {len(message)} chars")
                     break
 
         # Remove markdown formatting if present
         message = re.sub(r'\*\*(.+?)\*\*', r'\1', message)  # Bold
-        message = re.sub(r'\*(.+?)\*', r'\1', message)      # Italic
-        message = re.sub(r'`(.+?)`', r'\1', message)        # Code
+        message = re.sub(r'\*(.+?)\*', r'\1', message)  # Italic
+        message = re.sub(r'`(.+?)`', r'\1', message)  # Code
 
         # Remove leading numbers/bullets (1., -, *, etc.)
         message = re.sub(r'^[\d\-\*\•]+[\.\)]\s*', '', message)
@@ -177,39 +178,70 @@ class LLMClient:
 
         return message
 
-    def generate_message(self, prompt: str) -> Optional[str]:
+    def generate_message(self, prompt: str, max_retries: int = 3) -> Optional[str]:
         """Generate a reminder message using LLM.
 
         Args:
             prompt: Prompt to send to LLM
+            max_retries: Maximum number of retry attempts for API errors
 
         Returns:
             Generated message or None if failed
         """
-        try:
-            self.logger.debug(f"Sending prompt to LLM (provider: {self.provider}, model: {self.model})")
+        import time
 
-            if self.provider == 'gemini':
-                raw_message = self._generate_gemini(prompt)
-            else:
-                raw_message = self._generate_openai_compatible(prompt)
+        for attempt in range(max_retries):
+            try:
+                self.logger.debug(
+                    f"Sending prompt to LLM (provider: {self.provider}, model: {self.model}, attempt: {attempt + 1}/{max_retries})")
 
-            if not raw_message:
-                return None
+                if self.provider == 'gemini':
+                    raw_message = self._generate_gemini(prompt)
+                else:
+                    raw_message = self._generate_openai_compatible(prompt)
 
-            # Clean and validate the message
-            cleaned_message = self._clean_message(raw_message)
+                if not raw_message:
+                    return None
 
-            if not cleaned_message:
-                self.logger.error("Message cleanup failed, rejecting output")
-                return None
+                # Clean and validate the message
+                cleaned_message = self._clean_message(raw_message)
 
-            self.logger.info(f"Successfully generated message ({len(cleaned_message)} chars)")
-            return cleaned_message
+                if not cleaned_message:
+                    self.logger.error("Message cleanup failed, rejecting output")
+                    return None
 
-        except Exception as e:
-            self.logger.error(f"Error generating message: {e}")
-            raise
+                self.logger.info(f"Successfully generated message ({len(cleaned_message)} chars)")
+                return cleaned_message
+
+            except Exception as e:
+                error_msg = str(e).lower()
+
+                # Check if it's a capacity/rate limit error (503, 429)
+                is_capacity_error = any(indicator in error_msg for indicator in [
+                    'over capacity',
+                    '503',
+                    'rate limit',
+                    '429',
+                    'too many requests',
+                    'service unavailable',
+                    'internal_server_error'
+                ])
+
+                if is_capacity_error and attempt < max_retries - 1:
+                    # Exponential backoff: 2, 4, 8 seconds
+                    wait_time = 2 ** (attempt + 1)
+                    self.logger.warning(f"API capacity error (attempt {attempt + 1}/{max_retries}): {e}")
+                    self.logger.info(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Final attempt failed or non-retryable error
+                    self.logger.error(f"Error generating message (attempt {attempt + 1}/{max_retries}): {e}")
+                    if attempt == max_retries - 1:
+                        self.logger.error("All retry attempts exhausted")
+                    raise
+
+        return None
 
     def _generate_openai_compatible(self, prompt: str) -> Optional[str]:
         """Generate message using OpenAI-compatible API (OpenAI, Groq).
@@ -233,7 +265,8 @@ class LLMClient:
             )
 
             message = response.choices[0].message.content.strip()
-            self.logger.debug(f"Raw LLM response: {message[:200]}..." if len(message) > 200 else f"Raw LLM response: {message}")
+            self.logger.debug(
+                f"Raw LLM response: {message[:200]}..." if len(message) > 200 else f"Raw LLM response: {message}")
 
             return message
 
@@ -297,7 +330,8 @@ class LLMClient:
                 candidate = result['candidates'][0]
                 if 'content' in candidate and 'parts' in candidate['content']:
                     message = candidate['content']['parts'][0]['text'].strip()
-                    self.logger.debug(f"Raw LLM response: {message[:200]}..." if len(message) > 200 else f"Raw LLM response: {message}")
+                    self.logger.debug(f"Raw LLM response: {message[:200]}..." if len(
+                        message) > 200 else f"Raw LLM response: {message}")
                     return message
 
             self.logger.error("Unexpected Gemini API response structure")
