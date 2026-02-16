@@ -81,19 +81,29 @@ class Config:
 
         return value
 
-    def get_prompt(self) -> str:
+    def get_prompt(self, recent_messages: list = None) -> str:
         """Get formatted prompt with placeholders replaced.
+
+        Args:
+            recent_messages: List of recent sent messages for context
 
         Returns:
             Formatted prompt string
         """
         prompt_template = self.config['prompt']
 
+        # Format recent messages for context
+        if recent_messages:
+            messages_text = "\n".join([f"- {msg}" for msg in recent_messages])
+        else:
+            messages_text = "(No previous messages yet)"
+
         return prompt_template.format(
             sender_name=self.config['reminder']['sender_name'],
             target_name=self.config['reminder']['target_name'],
             book_title=self.config['reminder']['book_title'],
-            language=self.config['reminder'].get('language', 'Polish')
+            language=self.config['reminder'].get('language', 'Polish'),
+            recent_messages=messages_text
         )
 
     @property

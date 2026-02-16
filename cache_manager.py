@@ -31,13 +31,21 @@ class CacheManager:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.cache_file = self.cache_dir / "messages.json"
+        self.sent_file = self.cache_dir / "sent_messages.json"
         self._ensure_cache_file()
+        self._ensure_sent_file()
 
     def _ensure_cache_file(self):
         """Ensure cache file exists with proper structure."""
         if not self.cache_file.exists():
             self._write_cache([])
             self.logger.info("Created new cache file")
+
+    def _ensure_sent_file(self):
+        """Ensure sent messages file exists with proper structure."""
+        if not self.sent_file.exists():
+            self._write_sent([])
+            self.logger.info("Created new sent messages file")
 
     def _read_cache(self) -> List[dict]:
         """Read cache from file with validation.
@@ -87,6 +95,18 @@ class CacheManager:
             self.logger.error(f"Error reading cache: {e}")
             return []
 
+    def _read_sent(self) -> List[dict]:
+        """Read sent messages from file.
+
+        Returns:
+            List of sent message entries
+        """
+        try:
+            with open(self.sent_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            return []
+
     def _write_cache(self, cache: List[dict]):
         """Write cache to file.
 
@@ -99,6 +119,70 @@ class CacheManager:
         except Exception as e:
             self.logger.error(f"Error writing cache: {e}")
             raise
+
+    def _write_sent(self, sent: List[dict]):
+        """Write sent messages to file.
+
+        Args:
+            sent: List of sent message entries to write
+        """
+        try:
+            with open(self.sent_file, 'w', encoding='utf-8') as f:
+                json.dump(sent, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.logger.error(f"Error writing sent messages: {e}")
+            raise
+
+    def get_recent_sent_messages(self, count: int = 5) -> List[str]:
+        """Get recent sent messages for context.
+
+        Args:
+            count: Number of recent messages to retrieve
+
+        Returns:
+            List of recent message strings
+        """
+        sent = self._read_sent()
+
+        # If sent file is empty, use messages from cache instead
+        if not sent:
+            self.logger.debug("No sent messages yet, using cached messages for context")
+            cache = self._read_cache()
+            messages = [entry["message"] for entry in cache[-count:]]
+            return messages
+
+        # Get last N messages
+        recent = sent[-count:]
+        messages = [entry["message"] for entry in recent]
+
+        self.logger.debug(f"Retrieved {len(messages)} recent sent messages for context")
+        return messages
+
+    def mark_as_sent(self, message: str):
+        """Mark a message as sent by moving it to sent_messages.
+
+        Args:
+            message: The message that was sent
+        """
+        try:
+            sent = self._read_sent()
+
+            entry = {
+                "message": message,
+                "timestamp": datetime.now().isoformat()
+            }
+
+            sent.append(entry)
+
+            # Keep only last 20 sent messages
+            if len(sent) > 20:
+                sent = sent[-20:]
+
+            self._write_sent(sent)
+            self.logger.info(f"Marked message as sent (total sent: {len(sent)})")
+
+        except Exception as e:
+            self.logger.error(f"Failed to mark message as sent: {e}")
 
     def add_message(self, message: str) -> bool:
         """Add a message to the cache.

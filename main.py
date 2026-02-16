@@ -90,7 +90,12 @@ class ReminderApp:
             Generated message or None if failed
         """
         try:
-            prompt = self.config.get_prompt()
+            # Get recent sent messages for context
+            recent_messages = self.cache.get_recent_sent_messages(count=5)
+
+            # Generate prompt with context
+            prompt = self.config.get_prompt(recent_messages=recent_messages)
+
             message = self.llm.generate_message(prompt)
 
             if message:
@@ -176,6 +181,8 @@ class ReminderApp:
 
             if success:
                 self.logger.info("✓ Reminder sent successfully")
+                # Mark as sent
+                self.cache.mark_as_sent(message)
                 # Refill cache asynchronously
                 self._refill_cache()
             else:
