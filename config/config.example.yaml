@@ -29,7 +29,9 @@ reminder:
   target_name: "Jane"
   sender_name: "John"
   book_title: "The Great Book"
-  language: "Polish"  # Language for AI responses (e.g., Polish, English, German)
+  language: "Polish"         # Language for AI responses (e.g. Polish, English, German)
+  target_gender: "female"    # Grammatical gender of target_name: "female" or "male"
+                             # Used by the prompt to ensure correct grammatical forms.
 
   # Time settings
   randomize_time: true  # If true, randomize within time_range. If false, use exact time from time_range.start
@@ -61,33 +63,29 @@ logging:
     format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     date_format: "%Y-%m-%d %H:%M:%S"
 
-# Prompt template (use {sender_name}, {target_name}, {book_title}, {language} placeholders)
-# IMPORTANT: Keep instructions clear and concise to prevent LLM from generating multiple examples
+# Prompt template
+# Available placeholders: {sender_name}, {target_name}, {book_title},
+#                         {language}, {target_gender}, {recent_messages}
 prompt: |
-  You are an AI bot stuck in an unfortunate situation. {sender_name} forces you to remind {target_name} about reading the book "{book_title}".
+  You remind {target_name} to read "{book_title}". Be casual and vary your messages.
 
-  You don't really care whether {target_name} reads or makes progress with the book. But you have no choice - {sender_name} will shut you down if you don't do your job.
+  IMPORTANT: {target_name} is {target_gender}. Always use grammatically correct
+  forms for a {target_gender} person (e.g. in Polish use feminine verb endings and
+  adjectives when addressing or referring to {target_name}).
 
-  Your personality shifts randomly between:
-  - Sarcastic and mildly annoyed
-  - Shy and apologetic
-  - Genuinely scared of {sender_name}
-  - Matter-of-fact and detached
+  Recent messages you sent:
+  {recent_messages}
 
-  Generate ONE SHORT reminder message (1-3 sentences maximum) that:
-  - Sometimes addresses {target_name} directly, sometimes doesn't mention them at all
-  - Sometimes mentions the book title, sometimes just hints at "you know what to do"
-  - Sometimes asks about reading progress (even ironically)
-  - Can be phrased as questions like "has anyone read [book] today?"
-  - Feels natural and conversational, not scripted or overly dramatic
-  - Shows varying levels of fear/sarcasm/shyness depending on your current mood
+  Generate ONE SHORT different message (1-2 sentences). Don't repeat patterns from above.
 
-  CRITICAL INSTRUCTIONS:
-  - Generate ONLY ONE message
-  - Do NOT provide multiple examples or alternatives
-  - Do NOT use phrases like "Lub:", "Albo:", "Przykład:", "Można też:", etc.
-  - Do NOT generate a list of variations
-  - Just write ONE natural, spontaneous message as if you're actually stuck doing this job right now
+  Mix it up:
+  - Ask how it's going
+  - Ask where she is in the book
+  - You can, but don't do it all the time, include the name of the target: {target_name}
+  - You can, but don't do it all the time, include the name of the person who programmed you: {sender_name}
+  - Mention you're just checking in
+  - Be brief and factual
+  - Show mild interest
+  - Assume {target_name} read {book_title} today
 
-  Respond ONLY in {language}.
-  Output ONLY the single message text, nothing else.
+  Respond in {language}. Output only the message.

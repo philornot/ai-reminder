@@ -2,32 +2,41 @@
 
 import json
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+from typing import List, Optional
 
 
 class CacheManager:
-    """Manager for caching AI-generated messages."""
+    """Manager for caching AI-generated messages.
+
+    All public methods are thread-safe. A single reentrant lock guards every
+    read-modify-write operation so concurrent callers (e.g. a background
+    refill thread and the main send loop) cannot corrupt the JSON files.
+    """
 
     def __init__(
             self,
             cache_dir: str,
             cache_size: int = 10,
-            logger: Optional[logging.Logger] = None
+            logger: Optional[logging.Logger] = None,
     ):
         """Initialize cache manager.
 
         Args:
-            cache_dir: Directory for cache files
-            cache_size: Number of messages to keep in cache
-            logger: Logger instance
+            cache_dir: Directory for cache files.
+            cache_size: Number of messages to keep in cache.
+            logger: Logger instance.
         """
         self.cache_dir = Path(cache_dir)
         self.cache_size = cache_size
         self.logger = logger or logging.getLogger(__name__)
 
-        # Create cache directory
+        # RLock so that public methods can safely call other public methods
+        # without deadlocking (e.g. get_oldest_message → get_cache_count).
+        self._lock = threading.RLock()
+
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.cache_file = self.cache_dir / "messages.json"
@@ -35,301 +44,301 @@ class CacheManager:
         self._ensure_cache_file()
         self._ensure_sent_file()
 
-    def _ensure_cache_file(self):
+    # ------------------------------------------------------------------
+    # Internal helpers – callers must already hold self._lock
+    # ------------------------------------------------------------------
+
+    def _ensure_cache_file(self) -> None:
         """Ensure cache file exists with proper structure."""
         if not self.cache_file.exists():
             self._write_cache([])
             self.logger.info("Created new cache file")
 
-    def _ensure_sent_file(self):
+    def _ensure_sent_file(self) -> None:
         """Ensure sent messages file exists with proper structure."""
         if not self.sent_file.exists():
             self._write_sent([])
             self.logger.info("Created new sent messages file")
 
     def _read_cache(self) -> List[dict]:
-        """Read cache from file with validation.
+        """Read and validate the cache file.
 
         Returns:
-            List of cached message entries
+            List of valid cached message entries.
         """
         try:
-            with open(self.cache_file, 'r', encoding='utf-8') as f:
+            with open(self.cache_file, "r", encoding="utf-8") as f:
                 cache = json.load(f)
 
-                # Validate cache structure
-                if not isinstance(cache, list):
-                    self.logger.error(f"Invalid cache structure: expected list, got {type(cache)}")
-                    return []
+            if not isinstance(cache, list):
+                self.logger.error(
+                    "Invalid cache structure: expected list, got %s", type(cache)
+                )
+                return []
 
-                # Validate each entry
-                valid_cache = []
-                for i, entry in enumerate(cache):
-                    if not isinstance(entry, dict):
-                        self.logger.warning(f"Skipping invalid entry at index {i}: not a dict")
-                        continue
+            valid_cache: List[dict] = []
+            for i, entry in enumerate(cache):
+                if not isinstance(entry, dict):
+                    self.logger.warning("Skipping entry %d: not a dict", i)
+                    continue
+                if "message" not in entry:
+                    self.logger.warning("Skipping entry %d: missing 'message' key", i)
+                    continue
+                if not isinstance(entry["message"], str):
+                    self.logger.warning("Skipping entry %d: 'message' is not a string", i)
+                    continue
+                if not entry["message"].strip():
+                    self.logger.warning("Skipping entry %d: empty message", i)
+                    continue
+                valid_cache.append(entry)
 
-                    if "message" not in entry:
-                        self.logger.warning(f"Skipping invalid entry at index {i}: missing 'message' key")
-                        continue
+            removed = len(cache) - len(valid_cache)
+            if removed:
+                self.logger.warning("Removed %d invalid entries from cache", removed)
+                self._write_cache(valid_cache)
 
-                    if not isinstance(entry["message"], str):
-                        self.logger.warning(f"Skipping invalid entry at index {i}: 'message' is not a string")
-                        continue
+            return valid_cache
 
-                    # Additional check: message should not be empty
-                    if not entry["message"].strip():
-                        self.logger.warning(f"Skipping invalid entry at index {i}: empty message")
-                        continue
-
-                    valid_cache.append(entry)
-
-                if len(valid_cache) < len(cache):
-                    self.logger.warning(f"Removed {len(cache) - len(valid_cache)} invalid entries from cache")
-                    # Save cleaned cache
-                    self._write_cache(valid_cache)
-
-                return valid_cache
-
-        except (json.JSONDecodeError, FileNotFoundError) as e:
-            self.logger.error(f"Error reading cache: {e}")
+        except (json.JSONDecodeError, FileNotFoundError) as exc:
+            self.logger.error("Error reading cache: %s", exc)
             return []
 
     def _read_sent(self) -> List[dict]:
-        """Read sent messages from file.
+        """Read sent messages file.
 
         Returns:
-            List of sent message entries
+            List of sent message entries.
         """
         try:
-            with open(self.sent_file, 'r', encoding='utf-8') as f:
+            with open(self.sent_file, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, FileNotFoundError):
             return []
 
-    def _write_cache(self, cache: List[dict]):
-        """Write cache to file.
+    def _write_cache(self, cache: List[dict]) -> None:
+        """Write cache list to file.
 
         Args:
-            cache: List of message entries to write
+            cache: List of message entries to persist.
+
+        Raises:
+            OSError: If the file cannot be written.
         """
         try:
-            with open(self.cache_file, 'w', encoding='utf-8') as f:
+            with open(self.cache_file, "w", encoding="utf-8") as f:
                 json.dump(cache, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            self.logger.error(f"Error writing cache: {e}")
+        except Exception as exc:
+            self.logger.error("Error writing cache: %s", exc)
             raise
 
-    def _write_sent(self, sent: List[dict]):
-        """Write sent messages to file.
+    def _write_sent(self, sent: List[dict]) -> None:
+        """Write sent messages list to file.
 
         Args:
-            sent: List of sent message entries to write
+            sent: List of sent message entries to persist.
+
+        Raises:
+            OSError: If the file cannot be written.
         """
         try:
-            with open(self.sent_file, 'w', encoding='utf-8') as f:
+            with open(self.sent_file, "w", encoding="utf-8") as f:
                 json.dump(sent, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            self.logger.error(f"Error writing sent messages: {e}")
+        except Exception as exc:
+            self.logger.error("Error writing sent messages: %s", exc)
             raise
+
+    # ------------------------------------------------------------------
+    # Public API – every method acquires the lock for its entire operation
+    # ------------------------------------------------------------------
 
     def get_recent_sent_messages(self, count: int = 5) -> List[str]:
-        """Get recent sent messages for context.
+        """Return the most recently sent messages for LLM context.
+
+        Falls back to the pending cache when no messages have been sent yet.
 
         Args:
-            count: Number of recent messages to retrieve
+            count: Number of recent messages to retrieve.
 
         Returns:
-            List of recent message strings
+            List of message strings, oldest first.
         """
-        sent = self._read_sent()
-
-        # If sent file is empty, use messages from cache instead
-        if not sent:
-            self.logger.debug("No sent messages yet, using cached messages for context")
-            cache = self._read_cache()
-            messages = [entry["message"] for entry in cache[-count:]]
-            return messages
-
-        # Get last N messages
-        recent = sent[-count:]
-        messages = [entry["message"] for entry in recent]
-
-        self.logger.debug(f"Retrieved {len(messages)} recent sent messages for context")
-        return messages
-
-    def mark_as_sent(self, message: str):
-        """Mark a message as sent by moving it to sent_messages.
-
-        Args:
-            message: The message that was sent
-        """
-        try:
+        with self._lock:
             sent = self._read_sent()
 
-            entry = {
-                "message": message,
-                "timestamp": datetime.now().isoformat()
-            }
+            if not sent:
+                self.logger.debug(
+                    "No sent messages yet – using cached messages for context"
+                )
+                cache = self._read_cache()
+                return [entry["message"] for entry in cache[-count:]]
 
-            sent.append(entry)
+            recent = sent[-count:]
+            messages = [entry["message"] for entry in recent]
+            self.logger.debug(
+                "Retrieved %d recent sent messages for context", len(messages)
+            )
+            return messages
 
-            # Keep only last 20 sent messages
-            if len(sent) > 20:
-                sent = sent[-20:]
+    def mark_as_sent(self, message: str) -> None:
+        """Record a message as sent.
 
-            self._write_sent(sent)
-            self.logger.info(f"Marked message as sent (total sent: {len(sent)})")
-
-        except Exception as e:
-            self.logger.error(f"Failed to mark message as sent: {e}")
-
-    def add_message(self, message: str) -> bool:
-        """Add a message to the cache.
+        Appends the message to the sent-messages file and trims the history
+        to the last 20 entries.
 
         Args:
-            message: Message to cache
+            message: The message that was delivered to Discord.
+        """
+        with self._lock:
+            try:
+                sent = self._read_sent()
+                sent.append(
+                    {"message": message, "timestamp": datetime.now().isoformat()}
+                )
+                if len(sent) > 20:
+                    sent = sent[-20:]
+                self._write_sent(sent)
+                self.logger.info("Marked message as sent (total sent: %d)", len(sent))
+            except Exception as exc:
+                self.logger.error("Failed to mark message as sent: %s", exc)
+
+    def add_message(self, message: str) -> bool:
+        """Append a message to the pending cache.
+
+        Args:
+            message: Message text to cache.
 
         Returns:
-            True if successful, False otherwise
+            True if the message was added successfully, False otherwise.
         """
-        try:
-            # Validate message
-            if not message or not isinstance(message, str):
-                self.logger.error(f"Invalid message: must be non-empty string")
+        with self._lock:
+            try:
+                if not message or not isinstance(message, str):
+                    self.logger.error("Invalid message: must be a non-empty string")
+                    return False
+
+                message = message.strip()
+                if not message:
+                    self.logger.error("Invalid message: empty after stripping whitespace")
+                    return False
+
+                cache = self._read_cache()
+                cache.append(
+                    {"message": message, "timestamp": datetime.now().isoformat()}
+                )
+                self._write_cache(cache)
+                self.logger.info("Added message to cache (total: %d)", len(cache))
+                return True
+
+            except Exception as exc:
+                self.logger.error("Failed to add message to cache: %s", exc)
                 return False
-
-            message = message.strip()
-            if not message:
-                self.logger.error(f"Invalid message: empty after stripping")
-                return False
-
-            cache = self._read_cache()
-
-            entry = {
-                "message": message,
-                "timestamp": datetime.now().isoformat()
-            }
-
-            cache.append(entry)
-            self._write_cache(cache)
-
-            self.logger.info(f"Added message to cache (total: {len(cache)})")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Failed to add message to cache: {e}")
-            return False
 
     def get_oldest_message(self) -> Optional[str]:
-        """Get and remove the oldest message from cache.
+        """Remove and return the oldest message from the cache.
 
         Returns:
-            Oldest cached message or None if cache is empty
+            The oldest cached message string, or None if the cache is empty.
         """
-        try:
-            cache = self._read_cache()
+        with self._lock:
+            try:
+                cache = self._read_cache()
 
-            if not cache:
-                self.logger.warning("Cache is empty")
-                return None
+                if not cache:
+                    self.logger.warning("Cache is empty")
+                    return None
 
-            # Get oldest message (first in list)
-            oldest = cache.pop(0)
-            message = oldest["message"]
+                oldest = cache.pop(0)
+                message = oldest.get("message", "")
 
-            # Validate message before returning
-            if not message or not isinstance(message, str):
-                self.logger.error(f"Retrieved invalid message from cache: {type(message)}")
-                # Try to get next message
-                self._write_cache(cache)
-                if cache:
+                if not isinstance(message, str) or not message.strip():
+                    self.logger.error(
+                        "Retrieved invalid message from cache; discarding and retrying"
+                    )
+                    self._write_cache(cache)
+                    # Recurse – lock is reentrant so this is safe.
                     return self.get_oldest_message()
-                return None
 
-            message = message.strip()
-            if not message:
-                self.logger.error(f"Retrieved empty message from cache")
-                # Try to get next message
+                message = message.strip()
                 self._write_cache(cache)
-                if cache:
-                    return self.get_oldest_message()
+
+                self.logger.info(
+                    "Retrieved oldest message from cache (remaining: %d)", len(cache)
+                )
+                self.logger.debug(
+                    "Message content: %s",
+                    (message[:50] + "...") if len(message) > 50 else message,
+                )
+                return message
+
+            except Exception as exc:
+                self.logger.error("Failed to get message from cache: %s", exc)
                 return None
-
-            # Write updated cache
-            self._write_cache(cache)
-
-            self.logger.info(f"Retrieved oldest message from cache (remaining: {len(cache)})")
-            self.logger.debug(
-                f"Message content: {message[:50]}..." if len(message) > 50 else f"Message content: {message}")
-
-            return message
-
-        except Exception as e:
-            self.logger.error(f"Failed to get message from cache: {e}")
-            return None
 
     def get_cache_count(self) -> int:
-        """Get number of messages currently in cache.
+        """Return the number of messages currently in the cache.
 
         Returns:
-            Number of cached messages
+            Count of cached messages.
         """
-        cache = self._read_cache()
-        return len(cache)
+        with self._lock:
+            return len(self._read_cache())
 
     def is_cache_full(self) -> bool:
-        """Check if cache has reached target size.
+        """Check whether the cache has reached its target size.
 
         Returns:
-            True if cache is full, False otherwise
+            True if the cache is at or above the configured size limit.
         """
         return self.get_cache_count() >= self.cache_size
 
     def needs_refill(self) -> int:
-        """Calculate how many messages needed to fill cache.
+        """Calculate how many messages are needed to fill the cache.
 
         Returns:
-            Number of messages needed
+            Number of messages that should be generated to top up the cache.
         """
-        current = self.get_cache_count()
-        needed = self.cache_size - current
-        return max(0, needed)
+        return max(0, self.cache_size - self.get_cache_count())
 
-    def clear_cache(self):
-        """Clear all cached messages."""
-        self._write_cache([])
-        self.logger.info("Cache cleared")
+    def clear_cache(self) -> None:
+        """Remove all pending messages from the cache."""
+        with self._lock:
+            self._write_cache([])
+            self.logger.info("Cache cleared")
 
     def validate_and_repair_cache(self) -> bool:
-        """Validate cache file and repair if needed.
+        """Validate the cache file and remove duplicates.
 
         Returns:
-            True if cache is valid or was repaired successfully
+            True if the cache is valid or was repaired successfully.
         """
-        try:
-            cache = self._read_cache()
+        with self._lock:
+            try:
+                cache = self._read_cache()
 
-            # Check for duplicates
-            seen_messages = set()
-            unique_cache = []
-            duplicates = 0
+                seen: set = set()
+                unique_cache: List[dict] = []
+                duplicates = 0
 
-            for entry in cache:
-                msg = entry.get("message", "").strip()
-                if msg and msg not in seen_messages:
-                    seen_messages.add(msg)
-                    unique_cache.append(entry)
-                else:
-                    duplicates += 1
+                for entry in cache:
+                    msg = entry.get("message", "").strip()
+                    if msg and msg not in seen:
+                        seen.add(msg)
+                        unique_cache.append(entry)
+                    else:
+                        duplicates += 1
 
-            if duplicates > 0:
-                self.logger.warning(f"Removed {duplicates} duplicate messages from cache")
-                self._write_cache(unique_cache)
+                if duplicates:
+                    self.logger.warning(
+                        "Removed %d duplicate messages from cache", duplicates
+                    )
+                    self._write_cache(unique_cache)
 
-            self.logger.info(f"Cache validation complete: {len(unique_cache)} valid unique messages")
-            return True
+                self.logger.info(
+                    "Cache validation complete: %d valid unique messages",
+                    len(unique_cache),
+                )
+                return True
 
-        except Exception as e:
-            self.logger.error(f"Cache validation failed: {e}")
-            return False
+            except Exception as exc:
+                self.logger.error("Cache validation failed: %s", exc)
+                return False
