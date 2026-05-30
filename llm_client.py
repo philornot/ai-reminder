@@ -52,36 +52,28 @@ class LLMClient:
         self.temperature = temperature
         self.logger = logger or logging.getLogger(__name__)
 
-        # Validate provider
         if self.provider not in self.PROVIDER_CONFIGS:
-            raise ValueError(f"Unsupported provider: {provider}. Supported: {list(self.PROVIDER_CONFIGS.keys())}")
+            raise ValueError(
+                f"Unsupported provider: {provider}. "
+                f"Supported: {list(self.PROVIDER_CONFIGS.keys())}"
+            )
 
         provider_config = self.PROVIDER_CONFIGS[self.provider]
-
-        # Set model and base_url with fallbacks to defaults
         self.model = model or provider_config['default_model']
         self.base_url = base_url or provider_config['default_base_url']
 
-        self.logger.info(f"Initialized LLM client: provider={self.provider}, model={self.model}")
-
-        # Initialize client based on provider
-        if self.provider == 'gemini':
-            self._init_gemini_client()
-        else:
-            # OpenAI and Groq use OpenAI-compatible API - lazy import
-            self._init_openai_compatible_client()
-
-    def _init_openai_compatible_client(self):
-        """Initialize OpenAI-compatible client (OpenAI, Groq)."""
-        import openai
-        self.client = openai.OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
+        self.logger.info(
+            "Initialized LLM client: provider=%s, model=%s", self.provider, self.model
         )
 
-    def _init_gemini_client(self):
-        """Initialize Gemini client (uses REST API directly)."""
-        # Gemini uses a different API structure, we'll handle it separately
+        # Gemini uses a custom REST client; OpenAI-compatible providers (openai,
+        # groq) import the openai SDK lazily inside _generate_openai_compatible
+        # so that Groq users don't need the openai package installed.
+        if self.provider == 'gemini':
+            self._init_gemini_client()
+
+    def _init_gemini_client(self) -> None:
+        """Initialise Gemini client placeholder (uses raw requests, no SDK needed)."""
         self.client = None
 
     def _clean_message(self, raw_message: str) -> Optional[str]:
@@ -99,15 +91,14 @@ class LLMClient:
         if not raw_message:
             return None
 
-        # Remove leading/trailing whitespace
         message = raw_message.strip()
 
-        # Log original for debugging
         if len(message) > 200:
-            self.logger.warning(f"LLM returned long message ({len(message)} chars), attempting cleanup")
-            self.logger.debug(f"Original message: {message}")
+            self.logger.warning(
+                "LLM returned long message (%d chars), attempting cleanup", len(message)
+            )
+            self.logger.debug("Original message: %s", message)
 
-        # Patterns that indicate the LLM is generating examples/alternatives
         example_patterns = [
             r'Lub:',
             r'Albo:',
@@ -123,58 +114,57 @@ class LLMClient:
             r'Opcja \d+:',
         ]
 
-        # Check if message contains example indicators
-        has_examples = any(re.search(pattern, message, re.IGNORECASE) for pattern in example_patterns)
+        has_examples = any(
+            re.search(pattern, message, re.IGNORECASE) for pattern in example_patterns
+        )
 
         if has_examples:
             self.logger.warning("Message contains example indicators, extracting first variant")
-
-            # Split by common separators and take first part
-            separators = ['\n\nLub:', '\n\nAlbo:', '\n\nMoże:', '\n\nPrzykład:',
-                          '\nLub:', '\nAlbo:', '\nMoże:', '\nNastępnie:', '\nI jeszcze:',
-                          '\n\nLub tak:', '\nLub też:', '\nEwentualnie:']
-
+            separators = [
+                '\n\nLub:', '\n\nAlbo:', '\n\nMoże:', '\n\nPrzykład:',
+                '\nLub:', '\nAlbo:', '\nMoże:', '\nNastępnie:', '\nI jeszcze:',
+                '\n\nLub tak:', '\nLub też:', '\nEwentualnie:',
+            ]
             for separator in separators:
                 if separator in message:
-                    parts = message.split(separator)
-                    message = parts[0].strip()
+                    message = message.split(separator)[0].strip()
                     self.logger.info(
-                        f"Extracted first variant, reduced from {len(raw_message)} to {len(message)} chars")
+                        "Extracted first variant, reduced from %d to %d chars",
+                        len(raw_message), len(message),
+                    )
                     break
 
-        # Remove markdown formatting if present
-        message = re.sub(r'\*\*(.+?)\*\*', r'\1', message)  # Bold
-        message = re.sub(r'\*(.+?)\*', r'\1', message)  # Italic
-        message = re.sub(r'`(.+?)`', r'\1', message)  # Code
-
-        # Remove leading numbers/bullets (1., -, *, etc.)
+        message = re.sub(r'\*\*(.+?)\*\*', r'\1', message)
+        message = re.sub(r'\*(.+?)\*', r'\1', message)
+        message = re.sub(r'`(.+?)`', r'\1', message)
         message = re.sub(r'^[\d\-\*\•]+[\.\)]\s*', '', message)
-
-        # Final cleanup
         message = message.strip()
 
-        # Validate length - reminder should be reasonably short
         if len(message) > 500:
-            self.logger.warning(f"Message still too long after cleanup ({len(message)} chars), taking first sentence")
-            # Take first 1-2 sentences
+            self.logger.warning(
+                "Message still too long after cleanup (%d chars), taking first sentence",
+                len(message),
+            )
             sentences = re.split(r'[.!?]+\s+', message)
             if sentences:
-                # Take first sentence, or first two if first is very short
                 if len(sentences[0]) < 50 and len(sentences) > 1:
                     message = sentences[0] + '. ' + sentences[1] + '.'
                 else:
-                    message = sentences[0] + ('.' if not sentences[0].endswith(('.', '!', '?')) else '')
+                    message = sentences[0] + (
+                        '' if sentences[0].endswith(('.', '!', '?')) else '.'
+                    )
                 message = message.strip()
 
-        # Validate not empty
         if not message or len(message) < 10:
-            self.logger.error(f"Message too short after cleanup: '{message}'")
+            self.logger.error("Message too short after cleanup: %r", message)
             return None
 
-        # Log if we made significant changes
         if len(message) < len(raw_message) * 0.5:
-            self.logger.info(f"Significantly reduced message length: {len(raw_message)} → {len(message)} chars")
-            self.logger.debug(f"Cleaned message: {message}")
+            self.logger.info(
+                "Significantly reduced message length: %d → %d chars",
+                len(raw_message), len(message),
+            )
+            self.logger.debug("Cleaned message: %s", message)
 
         return message
 
@@ -193,7 +183,9 @@ class LLMClient:
         for attempt in range(max_retries):
             try:
                 self.logger.debug(
-                    f"Sending prompt to LLM (provider: {self.provider}, model: {self.model}, attempt: {attempt + 1}/{max_retries})")
+                    "Sending prompt to LLM (provider=%s, model=%s, attempt=%d/%d)",
+                    self.provider, self.model, attempt + 1, max_retries,
+                )
 
                 if self.provider == 'gemini':
                     raw_message = self._generate_gemini(prompt)
@@ -203,143 +195,134 @@ class LLMClient:
                 if not raw_message:
                     return None
 
-                # Clean and validate the message
                 cleaned_message = self._clean_message(raw_message)
-
                 if not cleaned_message:
                     self.logger.error("Message cleanup failed, rejecting output")
                     return None
 
-                self.logger.info(f"Successfully generated message ({len(cleaned_message)} chars)")
+                self.logger.info(
+                    "Successfully generated message (%d chars)", len(cleaned_message)
+                )
                 return cleaned_message
 
-            except Exception as e:
-                error_msg = str(e).lower()
-
-                # Check if it's a capacity/rate limit error (503, 429)
+            except Exception as exc:
+                error_msg = str(exc).lower()
                 is_capacity_error = any(indicator in error_msg for indicator in [
-                    'over capacity',
-                    '503',
-                    'rate limit',
-                    '429',
-                    'too many requests',
-                    'service unavailable',
-                    'internal_server_error'
+                    'over capacity', '503', 'rate limit', '429',
+                    'too many requests', 'service unavailable', 'internal_server_error',
                 ])
 
                 if is_capacity_error and attempt < max_retries - 1:
-                    # Exponential backoff: 2, 4, 8 seconds
                     wait_time = 2 ** (attempt + 1)
-                    self.logger.warning(f"API capacity error (attempt {attempt + 1}/{max_retries}): {e}")
-                    self.logger.info(f"Retrying in {wait_time} seconds...")
+                    self.logger.warning(
+                        "API capacity error (attempt %d/%d): %s — retrying in %ds",
+                        attempt + 1, max_retries, exc, wait_time,
+                    )
                     time.sleep(wait_time)
                     continue
-                else:
-                    # Final attempt failed or non-retryable error
-                    self.logger.error(f"Error generating message (attempt {attempt + 1}/{max_retries}): {e}")
-                    if attempt == max_retries - 1:
-                        self.logger.error("All retry attempts exhausted")
-                    raise
+
+                self.logger.error(
+                    "Error generating message (attempt %d/%d): %s",
+                    attempt + 1, max_retries, exc,
+                )
+                if attempt == max_retries - 1:
+                    self.logger.error("All retry attempts exhausted")
+                raise
 
         return None
 
     def _generate_openai_compatible(self, prompt: str) -> Optional[str]:
-        """Generate message using OpenAI-compatible API (OpenAI, Groq).
+        """Generate message using OpenAI-compatible API (OpenAI or Groq).
+
+        The ``openai`` SDK is imported here rather than at module level so
+        that users who only use Groq or Gemini are not forced to install it.
 
         Args:
             prompt: Prompt to send
 
         Returns:
-            Generated message
+            Generated message string, or None on empty response.
         """
-        import openai
+        try:
+            import openai
+        except ImportError as exc:
+            raise ImportError(
+                "The 'openai' package is required for the openai/groq providers.\n"
+                "Install it with:  pip install openai"
+            ) from exc
+
+        client = openai.OpenAI(api_key=self.api_key, base_url=self.base_url)
 
         try:
-            response = self.client.chat.completions.create(
+            response = client.chat.completions.create(
                 model=self.model,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ],
+                messages=[{"role": "user", "content": prompt}],
                 max_tokens=self.max_tokens,
-                temperature=self.temperature
+                temperature=self.temperature,
             )
-
             message = response.choices[0].message.content.strip()
             self.logger.debug(
-                f"Raw LLM response: {message[:200]}..." if len(message) > 200 else f"Raw LLM response: {message}")
-
+                "Raw LLM response: %s",
+                (message[:200] + "...") if len(message) > 200 else message,
+            )
             return message
 
-        except openai.APIError as e:
-            self.logger.error(f"API error: {e}")
+        except openai.APIError as exc:
+            self.logger.error("API error: %s", exc)
             raise
-        except openai.RateLimitError as e:
-            self.logger.error(f"Rate limit exceeded: {e}")
+        except openai.RateLimitError as exc:
+            self.logger.error("Rate limit exceeded: %s", exc)
             raise
-        except openai.APIConnectionError as e:
-            self.logger.error(f"API connection error: {e}")
+        except openai.APIConnectionError as exc:
+            self.logger.error("API connection error: %s", exc)
             raise
 
     def _generate_gemini(self, prompt: str) -> Optional[str]:
-        """Generate message using Google Gemini API.
+        """Generate message using Google Gemini REST API (no SDK required).
 
         Args:
             prompt: Prompt to send
 
         Returns:
-            Generated message
+            Generated message string, or None on empty response.
         """
+        url = f"{self.base_url}/v1beta/models/{self.model}:generateContent"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": self.temperature,
+                "maxOutputTokens": self.max_tokens,
+            },
+        }
+
         try:
-            # Gemini API endpoint
-            url = f"{self.base_url}/v1beta/models/{self.model}:generateContent"
-
-            headers = {
-                "Content-Type": "application/json"
-            }
-
-            # Add API key as query parameter for Gemini
-            params = {
-                "key": self.api_key
-            }
-
-            payload = {
-                "contents": [{
-                    "parts": [{
-                        "text": prompt
-                    }]
-                }],
-                "generationConfig": {
-                    "temperature": self.temperature,
-                    "maxOutputTokens": self.max_tokens,
-                }
-            }
-
             response = requests.post(
                 url,
-                headers=headers,
-                params=params,
+                headers={"Content-Type": "application/json"},
+                params={"key": self.api_key},
                 json=payload,
-                timeout=30
+                timeout=30,
             )
-
             response.raise_for_status()
             result = response.json()
 
-            # Extract text from Gemini response
-            if 'candidates' in result and len(result['candidates']) > 0:
-                candidate = result['candidates'][0]
-                if 'content' in candidate and 'parts' in candidate['content']:
-                    message = candidate['content']['parts'][0]['text'].strip()
-                    self.logger.debug(f"Raw LLM response: {message[:200]}..." if len(
-                        message) > 200 else f"Raw LLM response: {message}")
+            candidates = result.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    message = parts[0]["text"].strip()
+                    self.logger.debug(
+                        "Raw LLM response: %s",
+                        (message[:200] + "...") if len(message) > 200 else message,
+                    )
                     return message
 
-            self.logger.error("Unexpected Gemini API response structure")
+            self.logger.error("Unexpected Gemini API response structure: %s", result)
             raise ValueError("Invalid response from Gemini API")
 
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Gemini API request error: {e}")
+        except requests.exceptions.RequestException as exc:
+            self.logger.error("Gemini API request error: %s", exc)
             raise
-        except (KeyError, IndexError) as e:
-            self.logger.error(f"Error parsing Gemini response: {e}")
+        except (KeyError, IndexError) as exc:
+            self.logger.error("Error parsing Gemini response: %s", exc)
             raise
