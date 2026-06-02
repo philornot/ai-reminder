@@ -146,7 +146,7 @@ class ReminderApp:
         """Send a reminder message.
 
         Returns:
-            True if successful, False otherwise
+            True if successful, False otherwise.
         """
         # Prevent multiple simultaneous sends
         if self._is_sending:
@@ -155,6 +155,15 @@ class ReminderApp:
 
         try:
             self._is_sending = True
+
+            # Skip the regular reminder when the contextual-reminder mechanism
+            # already delivered a message today — no need to double-remind.
+            if self.cache.was_contextual_sent_today():
+                self.logger.info(
+                    "Skipping regular reminder — contextual reminder already sent today"
+                )
+                return False
+
             self.logger.info("=" * 60)
             self.logger.info("Starting reminder send process")
 

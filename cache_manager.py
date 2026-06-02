@@ -3,7 +3,7 @@
 import json
 import logging
 import threading
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -342,3 +342,33 @@ class CacheManager:
             except Exception as exc:
                 self.logger.error("Cache validation failed: %s", exc)
                 return False
+
+    _CONTEXTUAL_SENT_FILENAME = "contextual_sent.json"
+
+    def was_contextual_sent_today(self) -> bool:
+        """Check whether a contextual reminder was already sent today.
+
+        Reads the ``contextual_sent.json`` file written by ``ContextualReminder``
+        in the same cache directory and compares its ``last_sent_date`` field
+        against today's ISO date.
+
+        Returns:
+            True if a contextual reminder was delivered today, False otherwise
+            (including when the file is absent or unreadable).
+        """
+        contextual_sent_path = self.cache_dir / self._CONTEXTUAL_SENT_FILENAME
+        today = date.today().isoformat()
+
+        try:
+            if not contextual_sent_path.exists():
+                return False
+            with open(contextual_sent_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("last_sent_date") == today
+        except Exception as exc:
+            self.logger.warning(
+                "Could not read %s: %s — assuming no contextual reminder sent today",
+                contextual_sent_path,
+                exc,
+            )
+            return False
