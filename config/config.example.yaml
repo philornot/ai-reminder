@@ -39,6 +39,12 @@ reminder:
     start: "14:00"  # If randomize_time is false, reminder sent at this exact time
     end: "17:00"    # Used only when randomize_time is true
 
+  # Response window: how many hours after a sent reminder the bot will reply
+  # to whatever the target writes back (e.g. "stfu", "ok ok", "przeczytałam").
+  # Set to 0 to disable response-window mode entirely.
+  # Default: 3
+  response_window_hours: 3
+
 # Cache settings
 cache:
   cache_size: 10

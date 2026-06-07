@@ -233,3 +233,12 @@ class Config:
     def target_gender(self) -> str:
         """Grammatical gender of the reminder target (``female`` / ``male``)."""
         return self.config["reminder"].get("target_gender", "female")
+
+    @property
+    def response_window_hours(self) -> float:
+        """Hours the response window stays open after each sent reminder.
+
+        Configurable via ``reminder.response_window_hours`` in config.yaml.
+        Defaults to 3.0 hours.
+        """
+        return float(self.config["reminder"].get("response_window_hours", 3.0))

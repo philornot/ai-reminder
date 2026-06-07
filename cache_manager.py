@@ -16,6 +16,9 @@ class CacheManager:
     refill thread and the main send loop) cannot corrupt the JSON files.
     """
 
+    _CONTEXTUAL_SENT_FILENAME = "contextual_sent.json"
+    _RESPONSE_WINDOW_FILENAME = "response_window.json"
+
     def __init__(
             self,
             cache_dir: str,
@@ -343,8 +346,6 @@ class CacheManager:
                 self.logger.error("Cache validation failed: %s", exc)
                 return False
 
-    _CONTEXTUAL_SENT_FILENAME = "contextual_sent.json"
-
     def was_contextual_sent_today(self) -> bool:
         """Check whether a contextual reminder was already sent today.
 
@@ -372,3 +373,95 @@ class CacheManager:
                 exc,
             )
             return False
+
+    # ------------------------------------------------------------------
+    # Response-window API
+    # ------------------------------------------------------------------
+
+    def open_response_window(self, duration_hours: float) -> None:
+        """Record that a reminder was just sent and open a reply window.
+
+        While the window is open, ``ContextualReminder`` switches to
+        "response mode": instead of generating a fresh daily reminder it
+        replies directly to whatever the target writes next — "tak,
+        przeczytałam", "stfu", anything — with a witty comeback that still
+        weaves in the book.
+
+        The window state is stored in ``response_window.json`` in the cache
+        directory so it survives process restarts.
+
+        Args:
+            duration_hours: How many hours the window should remain open.
+                Configured via ``reminder.response_window_hours`` in
+                ``config.yaml``; defaults to 3 when omitted.
+        """
+        from datetime import timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        expires_at = (now + timedelta(hours=duration_hours)).isoformat()
+
+        path = self.cache_dir / self._RESPONSE_WINDOW_FILENAME
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "opened_at": now.isoformat(),
+                        "expires_at": expires_at,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            self.logger.info(
+                "Response window opened — expires at %s (%.1f h)",
+                expires_at,
+                duration_hours,
+            )
+        except Exception as exc:
+            self.logger.warning("Could not write response_window.json: %s", exc)
+
+    def is_response_window_open(self) -> bool:
+        """Return True when a response window is currently active.
+
+        Reads ``response_window.json`` and checks whether the ``expires_at``
+        timestamp is still in the future.  Naive timestamps written by older
+        versions of the code are treated as UTC.
+
+        Returns:
+            True if the window exists and has not yet expired.
+        """
+        from datetime import timezone
+
+        path = self.cache_dir / self._RESPONSE_WINDOW_FILENAME
+        try:
+            if not path.exists():
+                return False
+            data = json.loads(path.read_text(encoding="utf-8"))
+            expires_at = datetime.fromisoformat(data["expires_at"])
+            now = datetime.now(timezone.utc)
+            # Normalise naive datetimes (e.g. written without tz by old code) to UTC.
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            return now < expires_at
+        except Exception as exc:
+            self.logger.warning(
+                "Could not read response_window.json: %s — treating window as closed",
+                exc,
+            )
+            return False
+
+    def close_response_window(self) -> None:
+        """Explicitly close the response window before it naturally expires.
+
+        Called by ``ContextualReminder`` after the per-response cooldown has
+        elapsed and it decides not to reply again within the same window.
+        """
+        path = self.cache_dir / self._RESPONSE_WINDOW_FILENAME
+        try:
+            if path.exists():
+                path.unlink()
+                self.logger.info("Response window closed")
+        except Exception as exc:
+            self.logger.warning("Could not remove response_window.json: %s", exc)
