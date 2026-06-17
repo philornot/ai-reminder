@@ -1,0 +1,17 @@
+[Unit]
+Description=Discord Listener Bot (ai-reminder extension)
+After=network.target ai-reminder.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/minecraft-bot
+ExecStart=/home/pi/minecraft-bot/.venv/bin/python3 /home/pi/minecraft-bot/bot_listener.py
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

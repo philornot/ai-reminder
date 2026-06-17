@@ -1,0 +1,37 @@
+# config_listener.yaml — Discord Listener Bot configuration
+# Copy this file to config_listener.yaml and fill in your values.
+
+# Discord bot token.
+# In the Discord Developer Portal:
+#   Bot -> Token -> Reset Token
+# Also enable the "Message Content" privileged intent under:
+#   Bot -> Privileged Gateway Intents -> Message Content Intent
+discord_token: "YOUR_LISTENER_BOT_TOKEN_HERE"
+
+# Contextual book reminder — sends a witty reply to the target user's Discord
+# messages that sneaks in a book reminder. Powered by the ai-reminder project
+# running on the same host.
+contextual_reminder:
+  enabled: true
+
+  # Path to ai-reminder's config.yaml.
+  # Relative to the directory you run bot_listener.py from.
+  ai_reminder_config: "config/config.yaml"
+
+  # Discord user ID of the person to watch.
+  # How to find it: enable Developer Mode in Discord
+  # (Settings -> Advanced -> Developer Mode),
+  # then right-click the user -> Copy User ID.
+  target_discord_id: 123456789012345678
+
+  # Restrict monitoring to a single channel (null = all channels).
+  channel_id: null
+
+  # Minimum gap (minutes) between two response-window replies in the same
+  # window. Prevents flooding when the target sends several messages in a row.
+  # Default: 30
+  response_cooldown_minutes: 30
+
+  # Maximum number of messages to include as conversation context.
+  # Default: 20
+  context_message_limit: 20
