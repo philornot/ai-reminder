@@ -9,6 +9,10 @@ from typing import Optional
 class ReminderScheduler:
     """Scheduler for managing when reminders should be sent."""
 
+    # How long to wait before retrying after a genuine send failure
+    # (e.g. webhook/network error), instead of waiting until tomorrow.
+    _RETRY_COOLDOWN_SECONDS: int = 120
+
     def __init__(
             self,
             time_range_start: str,
@@ -121,13 +125,23 @@ class ReminderScheduler:
         return self.next_reminder_time
 
     def should_send_reminder(self) -> bool:
-        """Check if it's time to send a reminder.
+        """Check if it's time to attempt sending a reminder.
 
-        This method now resets the reminder time immediately when it's time to send,
-        preventing duplicate sends within the same check interval.
+        This only looks at timing and the "already sent today" flag. It does
+        NOT mark the reminder as sent — that happens later, in
+        ``report_send_result()``, once the caller actually knows whether the
+        send succeeded. Keeping those two steps separate avoids the previous
+        bug where a skipped or failed send was incorrectly treated as if it
+        had gone out, silently blocking the rest of the day.
+
+        To avoid re-triggering on every check while a send attempt is still
+        being processed by the caller, the scheduled time is pushed forward
+        by a short cooldown. ``report_send_result()`` either confirms that
+        push (success, or deliberately skipped) or cancels it (transient
+        failure → retry shortly).
 
         Returns:
-            True if reminder should be sent now
+            True if a send attempt should be made now.
         """
         if self.next_reminder_time is None:
             self.logger.warning("No reminder scheduled, scheduling now")
@@ -136,24 +150,58 @@ class ReminderScheduler:
 
         now = datetime.now()
 
-        if now >= self.next_reminder_time:
-            # Check if we already sent today
-            if self._reminder_sent_today:
-                self.logger.debug("Reminder already sent today, skipping")
-                return False
+        if now < self.next_reminder_time:
+            return False
 
-            self.logger.info("Time to send reminder")
+        if self._reminder_sent_today:
+            self.logger.debug("Reminder already sent today, skipping")
+            return False
 
-            # CRITICAL FIX: Reset next_reminder_time immediately to prevent double send
-            # Set to far future temporarily to prevent re-triggering
-            self.next_reminder_time = now + timedelta(days=1)
+        self.logger.info("Time to attempt sending reminder")
 
-            # Mark as sent today
+        # Push the trigger time forward briefly so should_send_reminder()
+        # doesn't fire again on the next check while the caller is still
+        # handling this attempt. report_send_result() will adjust this
+        # properly once the actual outcome is known.
+        self.next_reminder_time = now + timedelta(seconds=self._RETRY_COOLDOWN_SECONDS)
+
+        return True
+
+    def report_send_result(self, success: bool, skipped: bool = False) -> None:
+        """Record the outcome of a send attempt triggered by should_send_reminder().
+
+        Args:
+            success: True if the reminder was actually delivered.
+            skipped: True if sending was deliberately skipped on purpose
+                (e.g. a contextual reminder already went out today) rather
+                than attempted and failed. A skipped send counts as "handled
+                for today", same as a successful one — the regular reminder
+                should not retry or fire again until tomorrow.
+
+        Behavior:
+            * success or skipped → today is considered handled; the next
+              attempt is scheduled for tomorrow.
+            * neither (a real failure, e.g. webhook/network error) → today
+              is NOT marked as handled, and the next attempt is scheduled
+              shortly (see ``_RETRY_COOLDOWN_SECONDS``) so the bot retries
+              the same day instead of waiting until tomorrow.
+        """
+        if success or skipped:
             self._reminder_sent_today = True
-
-            return True
-
-        return False
+            reason = "delivered" if success else "skipped on purpose"
+            self.logger.info("Reminder attempt %s — done for today", reason)
+            # next_reminder_time currently holds the short cooldown value set
+            # by should_send_reminder(); replace it with tomorrow's slot now
+            # that today is settled.
+            self.schedule_next_reminder()
+        else:
+            self._reminder_sent_today = False
+            retry_at = datetime.now() + timedelta(seconds=self._RETRY_COOLDOWN_SECONDS)
+            self.next_reminder_time = retry_at
+            self.logger.warning(
+                "Reminder send failed — will retry at %s",
+                retry_at.strftime("%Y-%m-%d %H:%M:%S"),
+            )
 
     def get_seconds_until_next(self) -> float:
         """Get seconds until next scheduled reminder.

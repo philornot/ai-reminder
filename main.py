@@ -147,7 +147,7 @@ class ReminderApp:
         if success_count == 0:
             raise RuntimeError("Failed to generate any cache messages")
 
-    def _send_reminder(self) -> bool:
+    def _send_reminder(self) -> tuple[bool, bool]:
         """Send a reminder message and open a response window on success.
 
         After a reminder is delivered to Discord, ``CacheManager.open_response_window()``
@@ -155,13 +155,20 @@ class ReminderApp:
         and can reply to whatever the target writes back within the configured window.
 
         Returns:
-            True if the reminder was delivered successfully.
+            A ``(success, skipped)`` tuple.
+                success: True if the reminder was delivered successfully.
+                skipped: True if sending was deliberately skipped on purpose
+                    (contextual reminder already sent today, or a duplicate
+                    attempt while one was already in progress) rather than
+                    attempted and failed. The caller uses this to decide
+                    whether today should retry shortly (real failure) or
+                    wait until tomorrow (success or deliberate skip).
         """
         if self._is_sending:
             self.logger.warning(
                 "Already sending a reminder, skipping duplicate send attempt"
             )
-            return False
+            return False, True
 
         try:
             self._is_sending = True
@@ -172,7 +179,7 @@ class ReminderApp:
                 self.logger.info(
                     "Skipping regular reminder — contextual reminder already sent today"
                 )
-                return False
+                return False, True
 
             self.logger.info("=" * 60)
             self.logger.info("Starting reminder send process")
@@ -182,12 +189,12 @@ class ReminderApp:
             if not message:
                 self.logger.error("No cached message available")
                 self.webhook.send_error("Cache is empty, cannot send reminder")
-                return False
+                return False, False
 
             if not isinstance(message, str) or not message.strip():
                 self.logger.error("Invalid message retrieved: %s", type(message))
                 self.webhook.send_error("Invalid message format in cache")
-                return False
+                return False, False
 
             message = message.strip()
             self.logger.info(
@@ -212,12 +219,12 @@ class ReminderApp:
                 self.cache.add_message(message)
 
             self.logger.info("=" * 60)
-            return success
+            return success, False
 
         except Exception as exc:
             self.logger.error("Error sending reminder: %s", exc)
             self.webhook.send_error("Error sending reminder", exc)
-            return False
+            return False, False
         finally:
             self._is_sending = False
 
@@ -244,10 +251,9 @@ class ReminderApp:
 
             while True:
                 if self.scheduler.should_send_reminder():
-                    self.logger.debug("Scheduler indicates it's time to send reminder")
-                    self._send_reminder()
-                    self.logger.debug("Scheduling next reminder")
-                    self.scheduler.schedule_next_reminder()
+                    self.logger.debug("Scheduler indicates it's time to attempt a send")
+                    success, skipped = self._send_reminder()
+                    self.scheduler.report_send_result(success, skipped)
 
                 interval = self.scheduler.get_next_check_interval()
                 time.sleep(interval)
