@@ -79,7 +79,7 @@ logger = logging.getLogger("bot_listener")
 # Config
 # ---------------------------------------------------------------------------
 
-CONFIG_FILE = "config_listener.yaml"
+CONFIG_FILE = "config/config_listener.yaml"
 
 
 def _load_config() -> dict:
