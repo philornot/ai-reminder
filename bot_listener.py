@@ -9,7 +9,8 @@ What it does
 ------------
 * Connects to Discord with the Message Content privileged intent.
 * On every guild message: delegates to ContextualReminder.handle_message().
-* Refreshes presence every 60 s (just a static "Watching for messages" label).
+* Stays invisible at all times (status refreshed every 60 s) while still
+  listening and processing messages normally in the background.
 * Logs to both console and a rotating file (bot_listener.log).
 
 Configuration
@@ -19,7 +20,6 @@ Reads config_listener.yaml (copy config_listener.example.yaml and fill in):
     contextual_reminder — same block as in config_rpi.yaml; see that example
 """
 
-import asyncio
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
@@ -74,7 +74,6 @@ def _setup_logging() -> None:
 _setup_logging()
 logger = logging.getLogger("bot_listener")
 
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -114,7 +113,6 @@ if not TOKEN:
     logger.critical("'discord_token' missing from %s", CONFIG_FILE)
     sys.exit(1)
 
-
 # ---------------------------------------------------------------------------
 # ContextualReminder initialisation
 # ---------------------------------------------------------------------------
@@ -150,7 +148,7 @@ class ListenerBot(commands.Bot):
 
     def __init__(self) -> None:
         intents = discord.Intents.default()
-        intents.message_content = True   # privileged — must be enabled in the Developer Portal
+        intents.message_content = True  # privileged — must be enabled in the Developer Portal
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self) -> None:
@@ -159,11 +157,17 @@ class ListenerBot(commands.Bot):
         logger.info("Background tasks started")
 
     async def on_ready(self) -> None:
-        """Log successful connection."""
+        """Log successful connection and switch presence to invisible.
+
+        The bot must keep functioning normally in the background (still
+        receiving and processing every message event), it should just not
+        show any status to other Discord users.
+        """
         logger.info(
             "Listener bot connected as %s (id=%d)",
             self.user, self.user.id,
         )
+        await self.change_presence(status=discord.Status.invisible)
 
     async def on_message(self, message: discord.Message) -> None:
         """Forward every guild message to ContextualReminder.
@@ -194,15 +198,15 @@ bot = ListenerBot()
 
 @tasks.loop(seconds=60)
 async def presence_updater() -> None:
-    """Refresh Discord presence every 60 seconds."""
+    """Re-apply an invisible, activity-less presence every 60 seconds.
+
+    Discord can reset presence after reconnects/resumes, so this loop keeps
+    re-asserting "invisible" to make sure the bot never shows up as online
+    while it keeps listening and processing messages normally in the
+    background.
+    """
     try:
-        await bot.change_presence(
-            status=discord.Status.online,
-            activity=discord.Activity(
-                type=discord.ActivityType.watching,
-                name="for messages 📖",
-            ),
-        )
+        await bot.change_presence(status=discord.Status.invisible, activity=None)
     except Exception:
         logger.exception("presence_updater error")
 
