@@ -2,3 +2,4 @@ openai>=1.0.0
 requests>=2.31.0
 pyyaml>=6.0.1
 colorama>=0.4.6
+discord.py>=2.0.0
