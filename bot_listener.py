@@ -1,23 +1,22 @@
-"""
-Discord Listener Bot
-====================
+"""Discord Listener Bot.
+
 Lightweight Discord bot that acts as the listener layer for ai-reminder.
-No Minecraft server management — its only job is to watch for messages from
-the configured target user and hand them off to ContextualReminder.
+Its only job is to watch for messages from the configured target user and
+hand them off to ContextualReminder.
 
-What it does
-------------
-* Connects to Discord with the Message Content privileged intent.
-* On every guild message: delegates to ContextualReminder.handle_message().
-* Stays invisible at all times (status refreshed every 60 s) while still
-  listening and processing messages normally in the background.
-* Logs to both console and a rotating file (bot_listener.log).
+What it does:
+    * Connects to Discord with the Message Content privileged intent.
+    * On every guild message: delegates to ContextualReminder.handle_message().
+    * Registers the bot's own user with ContextualReminder on login so that
+      direct mention detection works correctly.
+    * Stays invisible at all times (status refreshed every 60 s) while still
+      listening and processing messages normally in the background.
+    * Logs to both console and a rotating file (bot_listener.log).
 
-Configuration
--------------
-Reads config_listener.yaml (copy config_listener.example.yaml and fill in):
-    discord_token       — bot token (needs Message Content intent enabled)
-    contextual_reminder — same block as in config_rpi.yaml; see that example
+Configuration:
+    Reads config_listener.yaml (copy config_listener.example.yaml and fill in):
+        discord_token       — bot token (needs Message Content intent enabled)
+        contextual_reminder — same block as in config.yaml; see that example
 """
 
 import logging
@@ -38,7 +37,7 @@ from contextual_reminder import ContextualReminder
 # ---------------------------------------------------------------------------
 
 def _setup_logging() -> None:
-    """Configure console + rotating-file logging."""
+    """Configure console + rotating-file logging for the listener process."""
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
@@ -66,7 +65,6 @@ def _setup_logging() -> None:
     root.addHandler(ch)
     root.addHandler(fh)
 
-    # Suppress noisy libraries
     logging.getLogger("discord").setLevel(logging.INFO)
     logging.getLogger("discord.http").setLevel(logging.WARNING)
 
@@ -157,17 +155,24 @@ class ListenerBot(commands.Bot):
         logger.info("Background tasks started")
 
     async def on_ready(self) -> None:
-        """Log successful connection and switch presence to invisible.
+        """Log successful connection, register bot user, and switch to invisible.
 
-        The bot must keep functioning normally in the background (still
-        receiving and processing every message event), it should just not
-        show any status to other Discord users.
+        The bot keeps functioning normally in the background (still receiving
+        and processing every message event); it just won't show any status to
+        other Discord users.
+
+        Registering ``self.user`` with ``ContextualReminder`` is required so
+        that mention detection (``message.mentions`` check) can identify pings
+        directed at this specific bot account.
         """
         logger.info(
             "Listener bot connected as %s (id=%d)",
             self.user, self.user.id,
         )
         await self.change_presence(status=discord.Status.invisible)
+
+        if contextual_reminder is not None:
+            contextual_reminder.set_bot_user(self.user)
 
     async def on_message(self, message: discord.Message) -> None:
         """Forward every guild message to ContextualReminder.
@@ -177,7 +182,6 @@ class ListenerBot(commands.Bot):
         """
         if contextual_reminder is not None:
             await contextual_reminder.handle_message(message)
-        # Still process prefix commands in case you add any later.
         await self.process_commands(message)
 
     async def on_error(self, event: str, *args, **kwargs) -> None:
@@ -201,9 +205,7 @@ async def presence_updater() -> None:
     """Re-apply an invisible, activity-less presence every 60 seconds.
 
     Discord can reset presence after reconnects/resumes, so this loop keeps
-    re-asserting "invisible" to make sure the bot never shows up as online
-    while it keeps listening and processing messages normally in the
-    background.
+    re-asserting invisible to make sure the bot never shows up as online.
     """
     try:
         await bot.change_presence(status=discord.Status.invisible, activity=None)

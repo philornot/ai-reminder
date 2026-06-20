@@ -1,41 +1,48 @@
 """Contextual book reminder triggered by the target user's Discord messages.
 
-Two operating modes
--------------------
+Three operating modes
+---------------------
 1. **Contextual mode** (default, existing behaviour):
    When the target user sends a message and the daily reminder has not yet
    been sent, the module asks the LLM to craft a reply that playfully
    references what they said while sneaking in a book reminder.
 
-2. **Response-window mode** (new):
+2. **Response-window mode**:
    After ``main.py`` sends a regular scheduled reminder it calls
    ``CacheManager.open_response_window()``.  While that window is open
    (duration configured via ``reminder.response_window_hours``, default 3 h)
    this module switches to "response mode": every message the target sends
-   triggers a witty comeback that acknowledges what they wrote — "tak,
-   przeczytałam", "stfu", or anything else — and still weaves in the book.
-   A per-reply cooldown (``contextual_reminder.response_cooldown_minutes``,
-   default 30 min) prevents flooding if the target keeps chatting.
+   triggers a witty comeback that acknowledges what they wrote and still
+   weaves in the book. A per-reply cooldown (``contextual_reminder.
+   response_cooldown_minutes``, default 30 min) prevents flooding if the
+   target keeps chatting.
+
+3. **Mention mode** (new):
+   When the target directly pings the bot (``@bot``), a reply is sent
+   immediately regardless of time-of-day window or daily-sent state.
+   The book is woven in where it fits naturally, but the primary goal is
+   a genuine response to the ping.  No cooldown applies.
 
 Conversation context
 --------------------
 Before generating a reply, the module fetches the recent message history
 from the Discord channel.  It walks backwards from the trigger message until
 it finds the last message sent by the bot (identified by ``client_user.id``),
-then passes every message in that window — including their author names and
-content — to the LLM prompt so the reply feels aware of the ongoing
-conversation rather than just the single trigger line.
+then passes every message in that window to the LLM prompt so the reply feels
+aware of the ongoing conversation.
 
-If the bot's last message cannot be found (e.g. the bot was offline when
-the conversation started, or the message was deleted), the window is capped
-at ``_CONTEXT_FALLBACK_LIMIT`` most-recent messages so the prompt never
-arrives empty and the feature degrades gracefully.
+If the bot's last message cannot be found the window is capped at
+``_CONTEXT_FALLBACK_LIMIT`` most-recent messages so the prompt never arrives
+empty and the feature degrades gracefully.
 
 Integration
 -----------
-Loaded by ``bot_rpi.py`` at startup.  Requires an ai-reminder project on the
-same host whose config path is stored under
-``contextual_reminder.ai_reminder_config`` in the MC bot's YAML config.
+Loaded by ``bot_listener.py`` at startup.  Requires an ai-reminder project on
+the same host whose config path is stored under
+``contextual_reminder.ai_reminder_config`` in the listener's YAML config.
+
+After the Discord client logs in, ``bot_listener.py`` must call
+``set_bot_user(client.user)`` so that mention detection works correctly.
 
 Required config keys (under ``contextual_reminder``):
     enabled (bool): Master switch.
@@ -128,17 +135,17 @@ class ContextualReminder:
     met, asks the configured LLM to craft a reply.  The reply style depends on
     the active mode:
 
-    - **Contextual mode**: weaves a reminder into a reaction to what the target
-      just said (existing behaviour, fires when no window is open and the daily
-      reminder has not been sent yet).
+    - **Mention mode**: fires when the bot is directly pinged (``@bot``).
+      Replies immediately regardless of time window or daily-sent state.
     - **Response-window mode**: fires while a response window is open (i.e.
-      shortly after a scheduled reminder was sent).  Acknowledges the target's
-      reply — whether grateful, dismissive, or anything in between — and keeps
-      the book in the conversation with a witty comeback.
+      shortly after a scheduled reminder was sent). Acknowledges the target's
+      reply with a witty comeback that keeps the book in the conversation.
+    - **Contextual mode**: weaves a reminder into a reaction to what the target
+      just said (fires when no window is open and the daily reminder has not
+      been sent yet).
 
-    In both modes the LLM receives a window of recent channel messages
-    (between the bot's last message and the trigger) so its reply is aware of
-    the conversation that led up to the trigger.
+    In all modes the LLM receives a window of recent channel messages so its
+    reply is aware of the conversation that led up to the trigger.
 
     All blocking I/O (LLM API calls, webhook HTTP requests) runs in a
     thread-pool executor so the Discord event loop is never stalled.
@@ -198,6 +205,11 @@ class ContextualReminder:
         # One generation at a time — prevents double-send when the target
         # sends a burst of messages before the first reply is marked as sent.
         self._generation_lock = asyncio.Lock()
+
+        # Set by set_bot_user() after the Discord client logs in so that
+        # mention detection can compare message.mentions against the real
+        # bot account.
+        self._bot_user: Optional[discord.ClientUser] = None
 
         # ------------------------------------------------------------------
         # Bootstrap ai-reminder imports
@@ -272,22 +284,39 @@ class ContextualReminder:
     # Public API
     # ------------------------------------------------------------------
 
+    def set_bot_user(self, bot_user: discord.ClientUser) -> None:
+        """Register the bot's own Discord user so mention detection works.
+
+        Must be called from ``on_ready`` after the bot has successfully
+        connected and ``client.user`` is populated.
+
+        Args:
+            bot_user: The logged-in bot's ClientUser object.
+        """
+        self._bot_user = bot_user
+        self.logger.debug(
+            "Contextual reminder: bot user registered (id=%d, name=%s)",
+            bot_user.id,
+            bot_user.name,
+        )
+
     async def handle_message(self, message: discord.Message) -> bool:
         """Process an incoming Discord message and act if appropriate.
 
         Decides which mode to run based on the current state:
 
+        - **Mention mode**: fires when ``self._bot_user`` is in
+          ``message.mentions``, bypassing time-window and daily-sent checks.
         - **Response-window mode**: fires when ``CacheManager.is_response_window_open()``
-          is True and the per-reply cooldown has elapsed.  Generates a witty
-          comeback to whatever the target wrote and resets the cooldown.
+          is True and the per-reply cooldown has elapsed.
         - **Contextual mode**: fires when no window is open, the daily
           contextual reminder has not been sent yet, and the time-window
           condition passes.
 
-        Both modes share the same pre-checks (bot filter, user filter, channel
-        filter, non-empty content) and the same generation lock.  Both modes
-        also receive the conversation context window fetched from the channel
-        history.
+        Both non-mention modes share the same pre-checks (bot filter, user
+        filter, channel filter, non-empty content) and the same generation
+        lock.  All modes receive the conversation context window fetched from
+        the channel history.
 
         Args:
             message: Incoming Discord message event.
@@ -317,23 +346,28 @@ class ContextualReminder:
         # ------------------------------------------------------------------
         # Determine mode without the lock (full re-check happens inside)
         # ------------------------------------------------------------------
+        is_mention = (
+            self._bot_user is not None
+            and self._bot_user in message.mentions
+        )
         in_response_window = self._cache.is_response_window_open()
 
-        if in_response_window:
-            # Quick pre-check: skip if still on cooldown.
+        if is_mention:
+            # Mention mode bypasses all cooldown/time-window guards.
+            pass
+        elif in_response_window:
             if not self._response_cooldown_elapsed():
                 self.logger.debug(
                     "Response-window mode: still on cooldown — skipping"
                 )
                 return False
         else:
-            # Contextual mode pre-check.
             if not self._should_send():
                 return False
 
         # ------------------------------------------------------------------
         # Fetch conversation context from channel history.
-        # This is done before acquiring the generation lock — it's a read-only
+        # Done before acquiring the generation lock — it's a read-only
         # Discord API call and doesn't need to be serialised.
         # ------------------------------------------------------------------
         context = await self._fetch_conversation_context(message)
@@ -360,9 +394,15 @@ class ContextualReminder:
 
         try:
             # Re-check conditions now that we hold the lock.
+            is_mention = (
+                self._bot_user is not None
+                and self._bot_user in message.mentions
+            )
             in_response_window = self._cache.is_response_window_open()
 
-            if in_response_window:
+            if is_mention:
+                return await self._handle_mention_mode(trigger_content, context)
+            elif in_response_window:
                 if not self._response_cooldown_elapsed():
                     self.logger.debug(
                         "Response-window mode: cooldown not elapsed (re-check) — skipping"
@@ -391,18 +431,12 @@ class ContextualReminder:
         sent by the bot itself.  Everything between that anchor point and the
         trigger message (exclusive on both ends) is collected as context.
 
-        **Fallback behaviour** — the bot message anchor is considered missing when:
-        - The channel history API call fails for any reason.
-        - No bot message is found within the fetched window (bot was offline,
-          or its message was deleted).
-
-        In that case the ``_CONTEXT_FALLBACK_LIMIT`` most-recent messages
-        (excluding the trigger) are used instead, so the LLM still receives
-        *some* conversational context.
+        Falls back to the ``_CONTEXT_FALLBACK_LIMIT`` most-recent messages
+        when the bot anchor cannot be found (bot was offline or message was
+        deleted), so the LLM still receives some context.
 
         The result is always capped at ``self.context_message_limit`` entries
-        (oldest entries are dropped when over the limit) to keep prompts
-        from growing unbounded.
+        to keep prompts from growing unbounded.
 
         Args:
             trigger_message: The Discord message that triggered this invocation.
@@ -411,30 +445,23 @@ class ContextualReminder:
             A ``_ConversationContext`` instance ready to be formatted for the prompt.
         """
         channel = trigger_message.channel
-        bot_user: Optional[discord.ClientUser] = channel.guild.me if hasattr(channel, "guild") else None
-
-        # Determine the bot's user ID.  ``guild.me`` is a Member, not a
-        # ClientUser, but both expose ``.id``.
+        bot_user = channel.guild.me if hasattr(channel, "guild") else None
         bot_id: Optional[int] = bot_user.id if bot_user is not None else None
 
         collected: list[tuple[str, str]] = []
         bot_message_found = False
 
         try:
-            # history() returns messages newest-first; we stop as soon as we
-            # find the bot's message or exhaust the fetch limit.
             async for msg in channel.history(
                     limit=_HISTORY_FETCH_LIMIT,
                     before=trigger_message,
             ):
-                # Stop at the bot's own message — that's our anchor.
                 if bot_id is not None and msg.author.id == bot_id:
                     bot_message_found = True
                     break
 
                 content = (msg.content or "").strip()
                 if not content:
-                    # Skip empty messages (attachments-only, embeds, etc.)
                     continue
 
                 author_name = (
@@ -453,12 +480,9 @@ class ContextualReminder:
             )
 
         if not bot_message_found and not collected:
-            # Nothing fetched at all — return empty context gracefully.
             return _ConversationContext(messages=[], bot_message_found=False)
 
         if not bot_message_found:
-            # Anchor not found — use the most recent _CONTEXT_FALLBACK_LIMIT
-            # messages from what we collected.
             self.logger.debug(
                 "Bot anchor message not found in last %d messages "
                 "(offline or deleted) — using fallback context (%d most-recent messages)",
@@ -467,10 +491,8 @@ class ContextualReminder:
             )
             collected = collected[:_CONTEXT_FALLBACK_LIMIT]
 
-        # collected is newest-first; reverse to chronological order.
         collected.reverse()
 
-        # Enforce the hard cap.
         if len(collected) > self.context_message_limit:
             self.logger.debug(
                 "Context window trimmed from %d to %d messages (limit reached)",
@@ -485,15 +507,71 @@ class ContextualReminder:
     # Mode handlers
     # ------------------------------------------------------------------
 
+    async def _handle_mention_mode(
+            self, trigger_content: str, context: _ConversationContext
+    ) -> bool:
+        """Generate and send a reply when the bot is directly mentioned.
+
+        Fires regardless of time-of-day window or daily-sent state — if the
+        target pings the bot they deserve a response.  The book reminder is
+        woven in naturally but the primary goal is to feel like a genuine
+        reply to the mention, not a canned reminder.
+
+        Does NOT mark ``contextual_sent_today`` so the regular daily reminder
+        can still fire later in the day.
+
+        Args:
+            trigger_content: Raw text of the message that mentioned the bot.
+            context: Conversation history window fetched from the channel.
+
+        Returns:
+            True if a reply was delivered successfully.
+        """
+        self.logger.info(
+            "Mention mode — generating reply for: %.80s%s",
+            trigger_content,
+            "..." if len(trigger_content) > 80 else "",
+        )
+
+        loop = asyncio.get_running_loop()
+
+        try:
+            reply_msg: Optional[str] = await loop.run_in_executor(
+                None, self._generate_mention_message, trigger_content, context
+            )
+        except Exception as exc:
+            self.logger.error("Mention-mode generation failed: %s", exc)
+            return False
+
+        if not reply_msg:
+            self.logger.warning("LLM returned empty message for mention reply")
+            return False
+
+        success: bool = await loop.run_in_executor(
+            None, self._webhook.send_reminder, reply_msg
+        )
+
+        if success:
+            self._cache.mark_as_sent(reply_msg)
+            self.logger.info(
+                "Mention-mode reply sent: %.80s%s",
+                reply_msg,
+                "..." if len(reply_msg) > 80 else "",
+            )
+        else:
+            self.logger.error("Mention-mode reply: webhook delivery failed")
+
+        return success
+
     async def _handle_contextual_mode(
             self, trigger_content: str, context: _ConversationContext
     ) -> bool:
         """Generate and send a contextual reminder reacting to trigger_content.
 
-        This is the original behaviour: craft a reply that feels like a genuine
-        reaction to the target's message while weaving in the book reminder.
-        The conversation context window is now included in the prompt so the
-        LLM can reference the broader conversation, not just the single trigger.
+        Crafts a reply that feels like a genuine reaction to the target's
+        message while weaving in the book reminder. The conversation context
+        window is included in the prompt so the LLM can reference the broader
+        conversation, not just the single trigger line.
 
         Args:
             trigger_content: Raw text of the target's Discord message.
@@ -546,11 +624,7 @@ class ContextualReminder:
 
         Fires while the response window is open (i.e. shortly after a
         scheduled reminder was sent).  The LLM is prompted to acknowledge
-        what the target wrote — dismissive, grateful, or anything in between
-        — and keep the book in the conversation.  The conversation context
-        window gives the LLM visibility into what was said between the last
-        bot message and this reply.
-
+        what the target wrote and keep the book in the conversation.
         After a successful send the per-reply cooldown is reset.
 
         Args:
@@ -604,11 +678,9 @@ class ContextualReminder:
     def _should_send(self) -> bool:
         """Evaluate whether contextual-mode conditions are satisfied.
 
-        Logic:
-            - Skip if a contextual reminder was already sent today.
-            - When ``randomize_time: true`` in ai-reminder config: also require
-              the current time to fall inside ``[time_range.start, time_range.end]``.
-            - When ``randomize_time: false``: any time of day is eligible.
+        Checks whether a contextual reminder was already sent today and,
+        when ``randomize_time`` is enabled, whether the current local time
+        falls inside the configured window.
 
         Returns:
             True if a contextual-mode reminder should be sent right now.
@@ -703,7 +775,6 @@ class ContextualReminder:
                 self._response_cooldown_path.read_text(encoding="utf-8")
             )
             last_reply_at = datetime.fromisoformat(data["last_reply_at"])
-            # Normalise naive timestamps to UTC.
             if last_reply_at.tzinfo is None:
                 last_reply_at = last_reply_at.replace(tzinfo=timezone.utc)
             elapsed = datetime.now(timezone.utc) - last_reply_at
@@ -751,6 +822,55 @@ class ContextualReminder:
     # ------------------------------------------------------------------
     # Prompt builders
     # ------------------------------------------------------------------
+
+    def _build_mention_prompt(
+            self, trigger_message: str, context: _ConversationContext
+    ) -> str:
+        """Build an LLM prompt for a direct-mention reply.
+
+        The target explicitly pinged the bot, so the reply should feel like a
+        direct, personal response rather than a canned reminder. The book is
+        woven in only where it fits naturally.
+
+        Args:
+            trigger_message: Raw text of the message that mentioned the bot.
+                Mention tokens like ``<@123>`` are left in; the LLM ignores them.
+            context: Conversation history window between the last bot message
+                and the trigger.
+
+        Returns:
+            Fully formatted prompt string ready to be sent to the LLM.
+        """
+        recent = self._cache.get_recent_sent_messages(count=3)
+        recent_text = (
+            "\n".join(f"- {m}" for m in recent) if recent else "(no previous messages)"
+        )
+
+        target = self._ai_config.get("reminder.target_name", "target")
+        book = self._ai_config.get("reminder.book_title", "the book")
+        language = self._ai_config.get("reminder.language", "Polish")
+        gender = self._ai_config.get("reminder.target_gender", "female")
+
+        context_section = self._format_context_section(context)
+
+        return (
+            f'You are a reminder bot whose job is to nudge {target} to read "{book}". '
+            f"{target} is {gender} — always use grammatically correct "
+            f"forms for a {gender} person.\n\n"
+            f"{context_section}"
+            f"{target} just directly mentioned (pinged) you and wrote:\n"
+            f'"{trigger_message}"\n\n'
+            f"Write ONE SHORT (1-2 sentences) reply that:\n"
+            f"1. Directly and naturally responds to what they said or asked — "
+            f"this is a direct ping so they expect a real answer\n"
+            f'2. If there\'s a natural opportunity, weave in a mention of "{book}", '
+            f"but don't force it — a genuine reply to the ping comes first\n"
+            f"3. Sounds like a real person texting, not a bot\n"
+            f"4. Takes the conversation context shown above into account\n\n"
+            f"Recent reminders already sent (do not repeat these patterns):\n"
+            f"{recent_text}\n\n"
+            f"Respond in {language}. Output only the message, nothing else."
+        )
 
     def _build_contextual_prompt(
             self, trigger_message: str, context: _ConversationContext
@@ -811,13 +931,10 @@ class ContextualReminder:
     ) -> str:
         """Build an LLM prompt for response-window-mode reply generation.
 
-        The target has just replied to a scheduled reminder — they might say
-        "ok ok", "stfu", "przeczytałam już", or anything else.  The model
-        should acknowledge what they wrote with a witty comeback and keep the
-        book in the conversation without being annoying.  The conversation
-        context window shows what was said after the reminder was sent,
-        giving the LLM awareness of whether the exchange has been playful,
-        dismissive, warm, etc.
+        The target has just replied to a scheduled reminder. The model should
+        acknowledge what they wrote with a witty comeback and keep the book in
+        the conversation without being annoying. The conversation context window
+        gives the LLM awareness of the tone of the exchange so far.
 
         Args:
             trigger_message: Raw text of the target's reply to the reminder.
@@ -897,6 +1014,21 @@ class ContextualReminder:
     # ------------------------------------------------------------------
     # Generation (blocking — must be called via run_in_executor)
     # ------------------------------------------------------------------
+
+    def _generate_mention_message(
+            self, trigger_content: str, context: _ConversationContext
+    ) -> Optional[str]:
+        """Synchronous mention-mode generation step.
+
+        Args:
+            trigger_content: Text content of the message that mentioned the bot.
+            context: Conversation history window.
+
+        Returns:
+            Generated reply text, or ``None`` on failure.
+        """
+        prompt = self._build_mention_prompt(trigger_content, context)
+        return self._llm.generate_message(prompt)
 
     def _generate_contextual_message(
             self, trigger_content: str, context: _ConversationContext
