@@ -18,10 +18,11 @@ Three operating modes
    target keeps chatting.
 
 3. **Mention mode** (new):
-   When the target directly pings the bot (``@bot``), a reply is sent
-   immediately regardless of time-of-day window or daily-sent state.
-   The book is woven in where it fits naturally, but the primary goal is
-   a genuine response to the ping.  No cooldown applies.
+   When the target directly pings the bot (``@bot``) or pings a role the
+   bot has (``@RoleName``), a reply is sent immediately regardless of
+   time-of-day window or daily-sent state. The book is woven in where it
+   fits naturally, but the primary goal is a genuine response to the ping.
+   No cooldown applies.
 
 Conversation context
 --------------------
@@ -65,16 +66,16 @@ IMPORTANT — Discord privileged intent:
     Then set ``intents.message_content = True`` in the bot class.
 """
 
-from pathlib import Path
-
 import asyncio
-import discord
 import json
 import logging
 import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
+
+import discord
 
 # How long to wait for the generation lock before giving up.
 _GENERATION_LOCK_TIMEOUT_S: float = 5.0
@@ -135,8 +136,9 @@ class ContextualReminder:
     met, asks the configured LLM to craft a reply.  The reply style depends on
     the active mode:
 
-    - **Mention mode**: fires when the bot is directly pinged (``@bot``).
-      Replies immediately regardless of time window or daily-sent state.
+    - **Mention mode**: fires when the bot is directly pinged (``@bot``) or
+      when one of its roles is pinged (``@RoleName``). Replies immediately
+      regardless of time window or daily-sent state.
     - **Response-window mode**: fires while a response window is open (i.e.
       shortly after a scheduled reminder was sent). Acknowledges the target's
       reply with a witty comeback that keeps the book in the conversation.
@@ -300,13 +302,46 @@ class ContextualReminder:
             bot_user.name,
         )
 
+    def _is_bot_mentioned(self, message: discord.Message) -> bool:
+        """Check whether the bot was pinged directly or via one of its roles.
+
+        Discord keeps direct user mentions and role mentions in separate
+        lists: ``message.mentions`` only contains users/members explicitly
+        @-mentioned, while pinging a role (e.g. ``@Reminders``) shows up in
+        ``message.role_mentions`` instead. A bot is never added to
+        ``message.mentions`` just because someone pinged a role it has, so
+        without this check those pings would silently fall through to
+        contextual or response-window mode instead of triggering a direct
+        reply.
+
+        Args:
+            message: Incoming Discord message event.
+
+        Returns:
+            True if the bot was mentioned directly, or if the message pings
+            a role that the bot currently has in that guild.
+        """
+        if self._bot_user is None:
+            return False
+
+        if self._bot_user in message.mentions:
+            return True
+
+        if message.role_mentions and message.guild is not None:
+            bot_member = message.guild.me
+            if bot_member is not None:
+                return any(role in bot_member.roles for role in message.role_mentions)
+
+        return False
+
     async def handle_message(self, message: discord.Message) -> bool:
         """Process an incoming Discord message and act if appropriate.
 
         Decides which mode to run based on the current state:
 
-        - **Mention mode**: fires when ``self._bot_user`` is in
-          ``message.mentions``, bypassing time-window and daily-sent checks.
+        - **Mention mode**: fires when the bot is mentioned directly or
+          through one of its roles (see ``_is_bot_mentioned``), bypassing
+          time-window and daily-sent checks.
         - **Response-window mode**: fires when ``CacheManager.is_response_window_open()``
           is True and the per-reply cooldown has elapsed.
         - **Contextual mode**: fires when no window is open, the daily
@@ -346,10 +381,7 @@ class ContextualReminder:
         # ------------------------------------------------------------------
         # Determine mode without the lock (full re-check happens inside)
         # ------------------------------------------------------------------
-        is_mention = (
-            self._bot_user is not None
-            and self._bot_user in message.mentions
-        )
+        is_mention = self._is_bot_mentioned(message)
         in_response_window = self._cache.is_response_window_open()
 
         if is_mention:
@@ -394,10 +426,7 @@ class ContextualReminder:
 
         try:
             # Re-check conditions now that we hold the lock.
-            is_mention = (
-                self._bot_user is not None
-                and self._bot_user in message.mentions
-            )
+            is_mention = self._is_bot_mentioned(message)
             in_response_window = self._cache.is_response_window_open()
 
             if is_mention:
@@ -513,9 +542,9 @@ class ContextualReminder:
         """Generate and send a reply when the bot is directly mentioned.
 
         Fires regardless of time-of-day window or daily-sent state — if the
-        target pings the bot they deserve a response.  The book reminder is
-        woven in naturally but the primary goal is to feel like a genuine
-        reply to the mention, not a canned reminder.
+        target pings the bot (or a role it has) they deserve a response.
+        The book reminder is woven in naturally but the primary goal is a
+        genuine reply to the mention, not a canned reminder.
 
         Does NOT mark ``contextual_sent_today`` so the regular daily reminder
         can still fire later in the day.
@@ -828,9 +857,9 @@ class ContextualReminder:
     ) -> str:
         """Build an LLM prompt for a direct-mention reply.
 
-        The target explicitly pinged the bot, so the reply should feel like a
-        direct, personal response rather than a canned reminder. The book is
-        woven in only where it fits naturally.
+        The target explicitly pinged the bot (or a role it has), so the
+        reply should feel like a direct, personal response rather than a
+        canned reminder. The book is woven in only where it fits naturally.
 
         Args:
             trigger_message: Raw text of the message that mentioned the bot.
