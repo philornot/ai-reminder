@@ -28,6 +28,9 @@ them via Discord webhooks. Optionally extends into a live Discord listener
   target's reply and fires a witty comeback
 - Contextual mode: if the target writes during the reminder window the bot
   reacts to whatever they said and sneaks the book in
+- Reply reactions: if the target uses Discord's native "reply" feature on
+  one of the bot's own messages, the bot asks the LLM whether an emoji
+  reaction fits the moment and, if so, adds one from a small hardcoded pool
 - Discord webhook integration with optional debug notifications
 - Coloured console logging with file rotation
 - Systemd service support

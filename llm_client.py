@@ -1,5 +1,6 @@
 """LLM client for generating reminder messages."""
 
+import json
 import logging
 import re
 from typing import Optional
@@ -171,12 +172,77 @@ class LLMClient:
     def generate_message(self, prompt: str, max_retries: int = 3) -> Optional[str]:
         """Generate a reminder message using LLM.
 
+        Runs the raw completion through ``_clean_message()`` to strip
+        Markdown formatting, trim overly long output, and drop any
+        "Lub:"/"Albo:"-style extra variants some models tack onto the reply.
+
         Args:
             prompt: Prompt to send to LLM
             max_retries: Maximum number of retry attempts for API errors
 
         Returns:
             Generated message or None if failed
+        """
+        raw_message = self._generate_raw(prompt, max_retries=max_retries)
+        if not raw_message:
+            return None
+
+        cleaned_message = self._clean_message(raw_message)
+        if not cleaned_message:
+            self.logger.error("Message cleanup failed, rejecting output")
+            return None
+
+        self.logger.info(
+            "Successfully generated message (%d chars)", len(cleaned_message)
+        )
+        return cleaned_message
+
+    def generate_json(self, prompt: str, max_retries: int = 2) -> Optional[dict]:
+        """Generate a small structured JSON decision from the LLM.
+
+        Intended for short yes/no-plus-choice decisions (e.g. "should the bot
+        react to this message, and with which emoji") where the reminder-text
+        cleanup pipeline in ``_clean_message()`` would do more harm than good
+        (it is tuned to strip Markdown and split off "Lub:"/"Albo:" variants
+        from free-form reminder sentences, not to preserve a JSON payload).
+
+        The raw completion is scanned for the first ``{...}`` block, which
+        tolerates models that wrap the JSON in a Markdown code fence or add a
+        short comment before/after it.
+
+        Args:
+            prompt: Prompt instructing the LLM to answer with a single JSON
+                object and nothing else.
+            max_retries: Maximum number of retry attempts for API errors.
+
+        Returns:
+            The parsed JSON object, or None if the call failed or the
+            response did not contain valid JSON.
+        """
+        raw_message = self._generate_raw(prompt, max_retries=max_retries)
+        if not raw_message:
+            return None
+        return self._parse_json_object(raw_message)
+
+    def _generate_raw(self, prompt: str, max_retries: int) -> Optional[str]:
+        """Call the configured provider and return its raw text completion.
+
+        Shared by ``generate_message()`` and ``generate_json()``. Retries on
+        transient capacity/rate-limit errors with exponential backoff; any
+        other error is re-raised immediately.
+
+        Args:
+            prompt: Prompt to send to the LLM.
+            max_retries: Maximum number of retry attempts for API errors.
+
+        Returns:
+            Raw, unprocessed text returned by the provider, or None on an
+            empty response.
+
+        Raises:
+            Exception: Re-raises the last provider error once retries (for
+                capacity/rate-limit errors) are exhausted, or immediately for
+                any non-transient error.
         """
         import time
 
@@ -188,22 +254,8 @@ class LLMClient:
                 )
 
                 if self.provider == 'gemini':
-                    raw_message = self._generate_gemini(prompt)
-                else:
-                    raw_message = self._generate_openai_compatible(prompt)
-
-                if not raw_message:
-                    return None
-
-                cleaned_message = self._clean_message(raw_message)
-                if not cleaned_message:
-                    self.logger.error("Message cleanup failed, rejecting output")
-                    return None
-
-                self.logger.info(
-                    "Successfully generated message (%d chars)", len(cleaned_message)
-                )
-                return cleaned_message
+                    return self._generate_gemini(prompt)
+                return self._generate_openai_compatible(prompt)
 
             except Exception as exc:
                 error_msg = str(exc).lower()
@@ -230,6 +282,30 @@ class LLMClient:
                 raise
 
         return None
+
+    def _parse_json_object(self, raw_text: str) -> Optional[dict]:
+        """Extract and parse the first JSON object found in raw text.
+
+        Tolerates Markdown code fences and any leading/trailing commentary a
+        model might add around the actual JSON payload.
+
+        Args:
+            raw_text: Raw text returned by the LLM.
+
+        Returns:
+            The parsed object, or None if no valid JSON object was found.
+        """
+        match = re.search(r"\{.*}", raw_text, re.DOTALL)
+        if not match:
+            self.logger.warning(
+                "No JSON object found in LLM response: %s", raw_text[:200]
+            )
+            return None
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            self.logger.warning("Could not parse JSON from LLM response: %s", exc)
+            return None
 
     def _generate_openai_compatible(self, prompt: str) -> Optional[str]:
         """Generate message using OpenAI-compatible API (OpenAI or Groq).

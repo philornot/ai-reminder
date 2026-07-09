@@ -24,6 +24,18 @@ Three operating modes
    fits naturally, but the primary goal is a genuine response to the ping.
    No cooldown applies.
 
+Reply reactions
+----------------
+Independently of the three modes above: whenever the target uses Discord's
+native "reply" feature to answer one of the bot's own sent messages (mention,
+contextual, or response-window), the module asks the LLM a small yes/no
+question — does adding an emoji reaction actually fit here, or would it look
+tone-deaf (e.g. the bot's message landed in the middle of an unrelated
+conversation and the "reply" isn't really engaging with it)? Only when the
+LLM says yes does the bot add a reaction, picking one emoji from a small
+hardcoded pool (see ``_REACTION_EMOJI_CHOICES``). This runs as a best-effort
+background task and never blocks or affects the normal reply-generation flow.
+
 Conversation context
 --------------------
 Before generating a reply, the module fetches the recent message history
@@ -144,6 +156,31 @@ _DEFAULT_MENTION_TASKS: list[str] = [
     'closing line nudging them toward "{book_title}".',
 ]
 
+# ---------------------------------------------------------------------------
+# Reply-reaction feature
+# ---------------------------------------------------------------------------
+# Hardcoded pool the LLM must pick from when it decides a reaction fits the
+# target's reply. Kept small and hardcoded on purpose — this is a light
+# flourish, not something that needs to be configurable per deployment.
+# Maps a short name (what the LLM answers with) to the actual Discord/unicode
+# emoji character (what gets passed to Message.add_reaction()).
+_REACTION_EMOJI_CHOICES: dict[str, str] = {
+    "flushed": "😳",
+    "eyes": "👀",
+    "joy": "😂",
+    "skull": "💀",
+    "thinking": "🤔",
+    "salute": "🫡",
+    "melting_face": "🫠",
+    "sob": "😭",
+    "fire": "🔥",
+    "heart": "❤️",
+}
+
+# Hard cap on how many sent messages we keep track of as "reactable" (i.e.
+# eligible for a reply-reaction). Old entries are dropped first.
+_MAX_REACTABLE_MESSAGES: int = 50
+
 
 @dataclass
 class _ConversationContext:
@@ -215,6 +252,7 @@ class ContextualReminder:
 
     _CONTEXTUAL_SENT_FILENAME = "contextual_sent.json"
     _RESPONSE_COOLDOWN_FILENAME = "response_cooldown.json"
+    _REACTABLE_MESSAGES_FILENAME = "reactable_messages.json"
 
     def __init__(self, mc_config: dict, logger: Optional[logging.Logger] = None) -> None:
         """Initialize the contextual reminder handler.
@@ -256,6 +294,12 @@ class ContextualReminder:
         # One generation at a time — prevents double-send when the target
         # sends a burst of messages before the first reply is marked as sent.
         self._generation_lock = asyncio.Lock()
+
+        # Reply-reaction decisions run as fire-and-forget background tasks
+        # (see handle_message / _maybe_react_to_reply). asyncio only holds a
+        # weak reference to a task, so we keep a strong one here until it
+        # finishes to make sure it isn't garbage-collected mid-flight.
+        self._background_tasks: set[asyncio.Task] = set()
 
         # Set by set_bot_user() after the Discord client logs in so that
         # mention detection can compare message.mentions against the real
@@ -320,6 +364,9 @@ class ContextualReminder:
         )
         self._response_cooldown_path = (
                 Path(self._ai_config.cache_dir) / self._RESPONSE_COOLDOWN_FILENAME
+        )
+        self._reactable_messages_path = (
+                Path(self._ai_config.cache_dir) / self._REACTABLE_MESSAGES_FILENAME
         )
 
         self.logger.info(
@@ -426,6 +473,22 @@ class ContextualReminder:
         trigger_content = (message.content or "").strip()
         if not trigger_content:
             return False
+
+        # ------------------------------------------------------------------
+        # Reply-reaction check — independent of the mode logic below.
+        # Only fires when the target used Discord's native "reply" feature
+        # and the message they replied to is one this bot actually sent.
+        # Runs in the background so it can never delay or break the normal
+        # reply-generation flow (see _maybe_react_to_reply's own try/except).
+        # ------------------------------------------------------------------
+        if message.reference is not None and message.reference.message_id is not None:
+            replied_to_content = self._find_reactable_content(message.reference.message_id)
+            if replied_to_content is not None:
+                task = asyncio.create_task(
+                    self._maybe_react_to_reply(message, trigger_content, replied_to_content)
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
 
         # ------------------------------------------------------------------
         # Determine mode without the lock (full re-check happens inside)
@@ -625,12 +688,14 @@ class ContextualReminder:
             self.logger.warning("LLM returned empty message for mention reply")
             return False
 
-        success: bool = await loop.run_in_executor(
-            None, self._webhook.send_reminder, reply_msg
+        sent_message_id: Optional[int] = await loop.run_in_executor(
+            None, self._webhook.send_reminder_get_id, reply_msg
         )
+        success = sent_message_id is not None
 
         if success:
             self._cache.mark_as_sent(reply_msg)
+            self._remember_reactable_message(sent_message_id, reply_msg)
             self.logger.info(
                 "Mention-mode reply sent: %.80s%s",
                 reply_msg,
@@ -678,13 +743,15 @@ class ContextualReminder:
             self.logger.warning("LLM returned empty message for contextual reminder")
             return False
 
-        success: bool = await loop.run_in_executor(
-            None, self._webhook.send_reminder, reminder_msg
+        sent_message_id: Optional[int] = await loop.run_in_executor(
+            None, self._webhook.send_reminder_get_id, reminder_msg
         )
+        success = sent_message_id is not None
 
         if success:
             self._mark_sent_today()
             self._cache.mark_as_sent(reminder_msg)
+            self._remember_reactable_message(sent_message_id, reminder_msg)
             self.logger.info(
                 "Contextual reminder sent: %.80s%s",
                 reminder_msg,
@@ -732,13 +799,15 @@ class ContextualReminder:
             self.logger.warning("LLM returned empty message for response-mode reply")
             return False
 
-        success: bool = await loop.run_in_executor(
-            None, self._webhook.send_reminder, reply_msg
+        sent_message_id: Optional[int] = await loop.run_in_executor(
+            None, self._webhook.send_reminder_get_id, reply_msg
         )
+        success = sent_message_id is not None
 
         if success:
             self._reset_response_cooldown()
             self._cache.mark_as_sent(reply_msg)
+            self._remember_reactable_message(sent_message_id, reply_msg)
             self.logger.info(
                 "Response-mode reply sent: %.80s%s",
                 reply_msg,
@@ -896,6 +965,174 @@ class ContextualReminder:
             self.logger.warning(
                 "Could not write response_cooldown.json: %s", exc
             )
+
+    # ------------------------------------------------------------------
+    # Reply-reaction helpers
+    # ------------------------------------------------------------------
+
+    def _remember_reactable_message(self, message_id: int, content: str) -> None:
+        """Record a just-sent message as eligible for a future reply-reaction.
+
+        Persisted to ``reactable_messages.json`` in the ai-reminder cache
+        directory so that when the target later replies to it using
+        Discord's native reply feature, ``handle_message()`` can recognise
+        which message they replied to and hand it off to the LLM for a
+        react/don't-react decision. The content is stored alongside the ID
+        so that decision doesn't need an extra Discord API round trip later.
+
+        The list is capped at ``_MAX_REACTABLE_MESSAGES`` entries (oldest
+        dropped first) so the file cannot grow without bound.
+
+        Args:
+            message_id: Discord snowflake ID of the message that was just sent.
+            content: Text content of that message.
+        """
+        try:
+            entries = self._read_reactable_messages()
+            entries.append(
+                {
+                    "message_id": message_id,
+                    "content": content,
+                    "sent_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            if len(entries) > _MAX_REACTABLE_MESSAGES:
+                entries = entries[-_MAX_REACTABLE_MESSAGES:]
+
+            self._reactable_messages_path.parent.mkdir(parents=True, exist_ok=True)
+            self._reactable_messages_path.write_text(
+                json.dumps(entries, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self.logger.warning("Could not persist reactable message id: %s", exc)
+
+    def _read_reactable_messages(self) -> list[dict]:
+        """Load the list of bot-sent messages eligible for a reply-reaction.
+
+        Returns:
+            Parsed list of ``{"message_id", "content", "sent_at"}`` entries,
+            or an empty list if the file is missing or unreadable.
+        """
+        try:
+            if not self._reactable_messages_path.exists():
+                return []
+            return json.loads(
+                self._reactable_messages_path.read_text(encoding="utf-8")
+            )
+        except Exception as exc:
+            self.logger.warning("Could not read reactable_messages.json: %s", exc)
+            return []
+
+    def _find_reactable_content(self, message_id: int) -> Optional[str]:
+        """Look up the text of a tracked bot-sent message by its Discord ID.
+
+        Args:
+            message_id: Discord snowflake ID, typically taken from
+                ``message.reference.message_id`` on an incoming reply.
+
+        Returns:
+            The original message's text if it is one the bot sent and is
+            still tracked, otherwise None.
+        """
+        for entry in self._read_reactable_messages():
+            if entry.get("message_id") == message_id:
+                return entry.get("content")
+        return None
+
+    def _build_reaction_decision_prompt(
+            self, reply_content: str, replied_to_content: str
+    ) -> str:
+        """Build a prompt asking the LLM whether a reaction fits this reply.
+
+        Deliberately framed as a judgement call rather than a default-yes:
+        the target's "reply" might just be them continuing an unrelated
+        conversation the bot's message happened to land in the middle of,
+        in which case a reaction would look like the bot wasn't paying
+        attention.
+
+        Args:
+            reply_content: Stripped text of the target's Discord reply.
+            replied_to_content: Text of the bot's message being replied to.
+
+        Returns:
+            Fully formatted prompt string ready to be sent to the LLM.
+        """
+        target = self._ai_config.get("reminder.target_name", "target")
+        emoji_list = "\n".join(
+            f"- {name}: {char}" for name, char in _REACTION_EMOJI_CHOICES.items()
+        )
+
+        return (
+            f"You sent {target} this Discord message:\n"
+            f'"{replied_to_content}"\n\n'
+            f"{target} used Discord's reply feature to respond directly to "
+            f"it, writing:\n"
+            f'"{reply_content}"\n\n'
+            "Decide whether adding an emoji reaction to their reply would "
+            "feel natural here, the way a person casually reacts to a text "
+            "message. Say no if the reply is long, serious, sensitive, or "
+            "reads like it's actually continuing a different conversation "
+            "your message just interrupted rather than genuinely engaging "
+            "with it — a reaction would look tone-deaf or inattentive "
+            "there.\n\n"
+            "If you do react, choose ONLY one name from this list:\n"
+            f"{emoji_list}\n\n"
+            "Respond with ONLY a single compact JSON object and nothing "
+            "else, in exactly one of these two shapes:\n"
+            '{"react": true, "emoji": "<one name from the list above>"}\n'
+            '{"react": false, "emoji": null}'
+        )
+
+    async def _maybe_react_to_reply(
+            self,
+            message: discord.Message,
+            reply_content: str,
+            replied_to_content: str,
+    ) -> None:
+        """Ask the LLM whether an emoji reaction fits, and add it if so.
+
+        Runs as a fire-and-forget background task whenever the target uses
+        Discord's native reply feature to respond directly to one of the
+        bot's own tracked messages. Reacting is treated as an optional,
+        low-stakes flourish, so any failure in this path (LLM call, JSON
+        parsing, Discord API) is logged and swallowed rather than raised —
+        it must never affect the main reply-generation flow in
+        ``handle_message()``.
+
+        Args:
+            message: The target's reply message (the one to react to).
+            reply_content: Stripped text content of the target's reply.
+            replied_to_content: Text of the bot's message that was replied to.
+        """
+        try:
+            prompt = self._build_reaction_decision_prompt(reply_content, replied_to_content)
+
+            loop = asyncio.get_running_loop()
+            decision: Optional[dict] = await loop.run_in_executor(
+                None, self._llm.generate_json, prompt
+            )
+
+            if not decision or not decision.get("react"):
+                self.logger.debug("Reaction decision: not reacting (%s)", decision)
+                return
+
+            emoji_name = decision.get("emoji")
+            emoji_char = _REACTION_EMOJI_CHOICES.get(emoji_name)
+            if emoji_char is None:
+                self.logger.warning(
+                    "Reaction decision picked an unknown emoji name: %r — skipping",
+                    emoji_name,
+                )
+                return
+
+            await message.add_reaction(emoji_char)
+            self.logger.info("Reacted to reply with :%s: (%s)", emoji_name, emoji_char)
+
+        except discord.HTTPException as exc:
+            self.logger.warning("Failed to add reaction: %s", exc)
+        except Exception:
+            self.logger.exception("Unexpected error while deciding/adding a reaction")
 
     # ------------------------------------------------------------------
     # Prompt builders

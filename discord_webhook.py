@@ -83,6 +83,49 @@ class DiscordWebhook:
         """
         return self.send_message(message, self.main_webhook_url)
 
+    def send_reminder_get_id(self, message: str) -> Optional[int]:
+        """Send a reminder to the main webhook and return the sent message's ID.
+
+        Behaves like send_reminder(), but passes Discord's ``wait=true`` query
+        parameter so the webhook endpoint waits for the message to be created
+        and returns its JSON representation instead of an empty 204 response.
+        Needed so a caller can later recognise a Discord "reply" pointed at
+        this specific message (see ContextualReminder's reply-reaction feature).
+
+        Args:
+            message: Reminder message to send.
+
+        Returns:
+            The Discord snowflake ID of the sent message, or None if delivery
+            failed or the webhook URL is not configured.
+        """
+        url = self.main_webhook_url
+        if not url or url == "YOUR_MAIN_WEBHOOK_URL_HERE":
+            self.logger.error("Webhook URL not configured")
+            return None
+
+        payload = {"content": message}
+
+        try:
+            response = requests.post(
+                url,
+                params={"wait": "true"},
+                data=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+                timeout=10
+            )
+            response.raise_for_status()
+            sent_message_id = int(response.json()["id"])
+            self.logger.info(f"Message sent successfully to Discord (id={sent_message_id})")
+            return sent_message_id
+
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Failed to send message to Discord: {e}")
+            return None
+        except (KeyError, ValueError, TypeError) as e:
+            self.logger.error(f"Unexpected webhook response while sending message: {e}")
+            return None
+
     def send_debug(self, message: str, level: int = logging.ERROR) -> bool:
         """Send debug/error message to debug webhook if configured.
 
