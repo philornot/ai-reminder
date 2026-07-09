@@ -70,17 +70,9 @@ logging:
     date_format: "%Y-%m-%d %H:%M:%S"
 
 # Prompt template
-# --------------
-# Instead of one prompt listing many possible things the message could do
-# ("mix it up: ask X, or Y, or Z, ..."), the prompt is split into:
-#   - "base": fixed instructions/context, with a {task} placeholder
-#   - "tasks": a list of single-focus task variants
 #
 # For every generated message, Python (config_loader.py) picks ONE task at
-# random and drops it into {task}. The LLM only ever has to do ONE clear
-# thing per message, instead of choosing between several instructions and
-# trying to satisfy all of them at once — which is what was causing garbled,
-# illogical messages from gpt-oss-120b. Add/edit/remove task variants freely.
+# random and drops it into {task}.
 #
 # Available placeholders in "base": {task}, {sender_name}, {target_name},
 #   {book_title}, {language}, {target_gender}, {recent_messages}
