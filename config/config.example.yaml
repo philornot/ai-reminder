@@ -70,28 +70,46 @@ logging:
     date_format: "%Y-%m-%d %H:%M:%S"
 
 # Prompt template
-# Available placeholders: {sender_name}, {target_name}, {book_title},
-#                         {language}, {target_gender}, {recent_messages}
-prompt: |
-  You remind {target_name} to read "{book_title}". Be casual and vary your messages.
-
-  IMPORTANT: {target_name} is {target_gender}. Always use grammatically correct
-  forms for a {target_gender} person (e.g. in Polish use feminine verb endings and
-  adjectives when addressing or referring to {target_name}).
-
-  Recent messages you sent:
-  {recent_messages}
-
-  Generate ONE SHORT different message (1-2 sentences). Don't repeat patterns from above.
-
-  Mix it up:
-  - Ask how it's going
-  - Ask where she is in the book
-  - You can, but don't do it all the time, include the name of the target: {target_name}
-  - You can, but don't do it all the time, include the name of the person who programmed you: {sender_name}
-  - Mention you're just checking in
-  - Be brief and factual
-  - Show mild interest
-  - Assume {target_name} read {book_title} today
-
-  Respond in {language}. Output only the message.
+# --------------
+# Instead of one prompt listing many possible things the message could do
+# ("mix it up: ask X, or Y, or Z, ..."), the prompt is split into:
+#   - "base": fixed instructions/context, with a {task} placeholder
+#   - "tasks": a list of single-focus task variants
+#
+# For every generated message, Python (config_loader.py) picks ONE task at
+# random and drops it into {task}. The LLM only ever has to do ONE clear
+# thing per message, instead of choosing between several instructions and
+# trying to satisfy all of them at once — which is what was causing garbled,
+# illogical messages from gpt-oss-120b. Add/edit/remove task variants freely.
+#
+# Available placeholders in "base": {task}, {sender_name}, {target_name},
+#   {book_title}, {language}, {target_gender}, {recent_messages}
+# Available placeholders in each "tasks" entry: {sender_name}, {target_name},
+#   {book_title}, {language}, {target_gender}, {recent_messages}
+prompt:
+  base: |
+    You remind {target_name} to read "{book_title}". Be casual.
+ 
+    IMPORTANT: {target_name} is {target_gender}. Always use grammatically correct
+    forms for a {target_gender} person (feminine verb endings and adjectives
+    when addressing or referring to {target_name}).
+ 
+    Recent messages you sent:
+    {recent_messages}
+ 
+    Task for this message: {task}
+ 
+    Generate ONE SHORT message (1-2 sentences) that does ONLY the task above.
+    Don't repeat patterns from the recent messages listed above.
+ 
+    Respond in {language}. Output only the message, nothing else.
+ 
+  tasks:
+    - "Ask how the reading is going."
+    - "Ask what chapter {target_name} is on right now (remember: rozdziały, not odcinki)."
+    - "Include {target_name}'s name, then ask a short question about the book."
+    - "Mention that {sender_name} programmed you, then ask if {target_name} read today."
+    - "Say you're a little bit bored with your job today, then briefly ask if {target_name} read anything."
+    - "Be brief and purely factual: just ask whether today's reading happened."
+    - "Show mild interest: ask what part of the story feels interesting right now."
+    - "Assume {target_name} read {book_title} today and ask how far they got."

@@ -1,5 +1,6 @@
 """Configuration loader and validator."""
 
+import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -64,6 +65,21 @@ class Config:
                 "Missing reminder.time_range.end (required when randomize_time is true)"
             )
 
+        prompt_cfg = self.config["prompt"]
+        if isinstance(prompt_cfg, dict):
+            if "base" not in prompt_cfg:
+                raise ValueError("Missing prompt.base")
+            if "tasks" not in prompt_cfg or not prompt_cfg["tasks"]:
+                raise ValueError(
+                    "Missing prompt.tasks (must be a non-empty list of task "
+                    "variants when 'prompt' is a dict)"
+                )
+        elif not isinstance(prompt_cfg, str):
+            raise ValueError(
+                "prompt must be either a plain string template, or a dict "
+                "with 'base' and 'tasks' keys"
+            )
+
     def get(self, key: str, default: Any = None) -> Any:
         """Return a configuration value using dot-notation.
 
@@ -84,11 +100,26 @@ class Config:
         return value
 
     def get_prompt(self, recent_messages: Optional[List[str]] = None) -> str:
-        """Return the prompt template with all placeholders substituted.
+        """Return a prompt with all placeholders substituted.
 
-        Supported placeholders:
+        The ``prompt`` config section supports two formats:
+
+        1. **Plain string** (legacy): used as-is, formatted directly.
+        2. **Dict with ``base`` and ``tasks``** (recommended): ``tasks`` is a
+           list of single-focus instructions (e.g. "ask how the reading is
+           going", "ask what chapter they're on"). One task is chosen at
+           random for each call and substituted into ``{task}`` inside
+           ``base``. This keeps every generated message focused on ONE
+           thing instead of asking the LLM to juggle several instructions
+           at once ("mix it up: do A, or B, or C, ..."), which is what was
+           causing incoherent/nonsensical messages with smaller models —
+           the model would try to satisfy multiple instructions in one
+           short reply and produce garbled text.
+
+        Supported placeholders in both ``base`` and ``tasks``:
             ``{sender_name}``, ``{target_name}``, ``{book_title}``,
-            ``{language}``, ``{target_gender}``, ``{recent_messages}``
+            ``{language}``, ``{target_gender}``, ``{recent_messages}``.
+            ``base`` additionally supports ``{task}`` (the chosen task text).
 
         Args:
             recent_messages: Recent sent messages used as LLM context.
@@ -98,28 +129,58 @@ class Config:
             Fully formatted prompt string.
 
         Raises:
-            ValueError: If the template contains an unknown placeholder.
+            ValueError: If the template contains an unknown placeholder, or
+                if ``prompt.tasks`` is empty.
         """
-        prompt_template = self.config["prompt"]
+        prompt_cfg = self.config["prompt"]
+        reminder_cfg = self.config["reminder"]
 
         if recent_messages:
             messages_text = "\n".join(f"- {msg}" for msg in recent_messages)
         else:
             messages_text = "(No previous messages yet)"
 
+        base_kwargs = dict(
+            sender_name=reminder_cfg["sender_name"],
+            target_name=reminder_cfg["target_name"],
+            book_title=reminder_cfg["book_title"],
+            language=reminder_cfg.get("language", "Polish"),
+            target_gender=reminder_cfg.get("target_gender", "female"),
+            recent_messages=messages_text,
+        )
+
+        # Legacy plain-string prompt — used verbatim, no task selection.
+        if isinstance(prompt_cfg, str):
+            try:
+                return prompt_cfg.format(**base_kwargs)
+            except KeyError as exc:
+                raise ValueError(
+                    f"Unknown placeholder in prompt template: {exc}. "
+                    "Supported placeholders: sender_name, target_name, "
+                    "book_title, language, target_gender, recent_messages."
+                ) from exc
+
+        # New base+tasks format.
+        tasks = prompt_cfg["tasks"]
+        if not tasks:
+            raise ValueError("prompt.tasks must contain at least one task")
+
+        task_template = random.choice(tasks)
         try:
-            return prompt_template.format(
-                sender_name=self.config["reminder"]["sender_name"],
-                target_name=self.config["reminder"]["target_name"],
-                book_title=self.config["reminder"]["book_title"],
-                language=self.config["reminder"].get("language", "Polish"),
-                target_gender=self.config["reminder"].get("target_gender", "female"),
-                recent_messages=messages_text,
-            )
+            task_text = task_template.format(**base_kwargs)
         except KeyError as exc:
             raise ValueError(
-                f"Unknown placeholder in prompt template: {exc}. "
-                "Supported placeholders: sender_name, target_name, book_title, "
+                f"Unknown placeholder in prompt task variant: {exc}. "
+                "Supported placeholders: sender_name, target_name, "
+                "book_title, language, target_gender, recent_messages."
+            ) from exc
+
+        try:
+            return prompt_cfg["base"].format(task=task_text, **base_kwargs)
+        except KeyError as exc:
+            raise ValueError(
+                f"Unknown placeholder in prompt.base: {exc}. Supported "
+                "placeholders: task, sender_name, target_name, book_title, "
                 "language, target_gender, recent_messages."
             ) from exc
 

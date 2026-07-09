@@ -69,6 +69,7 @@ IMPORTANT — Discord privileged intent:
 import asyncio
 import json
 import logging
+import random
 import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime, timedelta, timezone
@@ -94,6 +95,54 @@ _CONTEXT_FALLBACK_LIMIT: int = 10
 # discord.py history() fetch limit — fetched in one batch; large enough to
 # find the bot message in most normal channels without being wasteful.
 _HISTORY_FETCH_LIMIT: int = 50
+
+# ---------------------------------------------------------------------------
+# Single-task prompt variants
+# ---------------------------------------------------------------------------
+# Each mode used to ask the LLM to satisfy several instructions at once
+# ("react to what they said" + "sneak in the book" + "match the tone" + ...).
+# Small/quick models (like the default gpt-oss-120b) tend to produce
+# nonsensical or ungrammatical output when asked to juggle that many
+# constraints in a single short reply.
+#
+# Instead, Python picks ONE task per generation (random.choice) and the LLM
+# only has to do that one thing. This mirrors the approach used for the
+# scheduled reminder prompt in config.yaml (see Config.get_prompt()).
+#
+# These lists can be overridden per-deployment via the ai-reminder config.yaml
+# under reminder.contextual_tasks / reminder.response_tasks / reminder.mention_tasks
+# (each a list of strings). Placeholders {target_name}, {book_title} and
+# {sender_name} are substituted before the task is inserted into the prompt.
+_DEFAULT_CONTEXTUAL_TASKS: list[str] = [
+    'Playfully riff on what they just said in one short phrase, then '
+    'casually mention "{book_title}" — keep the link light, it does not '
+    'need to make perfect logical sense.',
+    'React to their message with a brief joke, then ask a quick question '
+    'about how "{book_title}" is going.',
+    'Give a short, deadpan reaction to what they said, then bring up '
+    '"{book_title}" almost as an afterthought.',
+    'Acknowledge their message in a few words, then pivot straight to '
+    'asking whether they read "{book_title}" today.',
+]
+
+_DEFAULT_RESPONSE_TASKS: list[str] = [
+    'If their reply is dismissive, tease them lightly about it. If it is '
+    'positive, react with a bit of enthusiasm. Either way, keep '
+    '"{book_title}" in the reply.',
+    'Give a short witty comeback to what they said, and mention '
+    '"{book_title}" only if it fits naturally — do not force it into a '
+    'very short reply.',
+    'React to their reply in one short line, then ask a quick follow-up '
+    'question about "{book_title}".',
+]
+
+_DEFAULT_MENTION_TASKS: list[str] = [
+    'Give a direct, genuine answer to what they asked or said — that comes '
+    'first since this is a direct ping — and only weave in "{book_title}" '
+    'if there is a natural opening.',
+    'Answer them properly like a real reply to a ping, then add one short '
+    'closing line nudging them toward "{book_title}".',
+]
 
 
 @dataclass
@@ -852,6 +901,47 @@ class ContextualReminder:
     # Prompt builders
     # ------------------------------------------------------------------
 
+    def _pick_task(self, config_key: str, defaults: list[str]) -> str:
+        """Pick ONE random task instruction for this generation.
+
+        Reads an optional list of task variants from the ai-reminder config
+        (falling back to the built-in defaults), then substitutes the
+        target/book/sender placeholders into the chosen variant.
+
+        Picking a single task in Python — instead of asking the LLM to
+        satisfy several instructions in one go — keeps each generation
+        focused on one clear thing, which noticeably reduces incoherent or
+        ungrammatical replies from smaller models.
+
+        Args:
+            config_key: Dot-notation key under the ai-reminder config
+                (e.g. ``"reminder.contextual_tasks"``).
+            defaults: Fallback list of task templates used when the key is
+                absent or empty in config.
+
+        Returns:
+            A single, fully-formatted task instruction string.
+        """
+        tasks = self._ai_config.get(config_key, None) or defaults
+
+        target = self._ai_config.get("reminder.target_name", "target")
+        book = self._ai_config.get("reminder.book_title", "the book")
+        sender = self._ai_config.get("reminder.sender_name", "my creator")
+
+        task_template = random.choice(tasks)
+        try:
+            return task_template.format(
+                target_name=target, book_title=book, sender_name=sender
+            )
+        except KeyError:
+            # A misconfigured custom task used an unknown placeholder —
+            # fall back to the raw template rather than crashing generation.
+            self.logger.warning(
+                "Unknown placeholder in task template for %s; using it as-is",
+                config_key,
+            )
+            return task_template
+
     def _build_mention_prompt(
             self, trigger_message: str, context: _ConversationContext
     ) -> str:
@@ -881,6 +971,7 @@ class ContextualReminder:
         gender = self._ai_config.get("reminder.target_gender", "female")
 
         context_section = self._format_context_section(context)
+        task = self._pick_task("reminder.mention_tasks", _DEFAULT_MENTION_TASKS)
 
         return (
             f'You are a reminder bot whose job is to nudge {target} to read "{book}". '
@@ -889,13 +980,10 @@ class ContextualReminder:
             f"{context_section}"
             f"{target} just directly mentioned (pinged) you and wrote:\n"
             f'"{trigger_message}"\n\n'
-            f"Write ONE SHORT (1-2 sentences) reply that:\n"
-            f"1. Directly and naturally responds to what they said or asked — "
-            f"this is a direct ping so they expect a real answer\n"
-            f'2. If there\'s a natural opportunity, weave in a mention of "{book}", '
-            f"but don't force it — a genuine reply to the ping comes first\n"
-            f"3. Sounds like a real person texting, not a bot\n"
-            f"4. Takes the conversation context shown above into account\n\n"
+            f"Task for this reply: {task}\n\n"
+            f"Write ONE SHORT (1-2 sentences) reply. Sound like a real "
+            f"person texting, not a bot, and take the conversation context "
+            f"shown above into account.\n\n"
             f"Recent reminders already sent (do not repeat these patterns):\n"
             f"{recent_text}\n\n"
             f"Respond in {language}. Output only the message, nothing else."
@@ -929,6 +1017,7 @@ class ContextualReminder:
         gender = self._ai_config.get("reminder.target_gender", "female")
 
         context_section = self._format_context_section(context)
+        task = self._pick_task("reminder.contextual_tasks", _DEFAULT_CONTEXTUAL_TASKS)
 
         return (
             f'You remind {target} to read "{book}". '
@@ -937,19 +1026,11 @@ class ContextualReminder:
             f"{context_section}"
             f'{target} just wrote on Discord:\n'
             f'"{trigger_message}"\n\n'
-            f"Write ONE SHORT (1-2 sentences) casual reply that:\n"
-            f"1. Playfully references or riffs on what they just said "
-            f"(taking the recent conversation into account if relevant)\n"
-            f'2. Sneaks in a reminder about "{book}" — the connection should '
-            f"feel witty, not forced\n"
-            f"3. Sounds like a real person texting, not a bot\n\n"
-            f"Tone examples (adapt, don't copy):\n"
-            f'- They said "Anyone want to play Valorant?" → '
-            f'"Maybe you\'d like to play reading {book}?"\n'
-            f'- They said "I\'m so tired today" → '
-            f'"Lie in bed with {book} then, perfect excuse"\n'
-            f'- They said "What should I cook for dinner?" → '
-            f'"No idea, but I know what you should do while it\'s on the stove"\n\n'
+            f"Task for this reply: {task}\n\n"
+            f"Write ONE SHORT (1-2 sentences) casual reply. Sound like a "
+            f"real person texting, not a bot. Take the recent conversation "
+            f"into account if it's relevant, but don't force a connection "
+            f"that doesn't make sense.\n\n"
             f"Recent reminders already sent (do not repeat these patterns):\n"
             f"{recent_text}\n\n"
             f"Respond in {language}. Output only the message, nothing else."
@@ -984,6 +1065,7 @@ class ContextualReminder:
         gender = self._ai_config.get("reminder.target_gender", "female")
 
         context_section = self._format_context_section(context)
+        task = self._pick_task("reminder.response_tasks", _DEFAULT_RESPONSE_TASKS)
 
         return (
             f'You just sent {target} a reminder to read "{book}". '
@@ -992,23 +1074,10 @@ class ContextualReminder:
             f"{context_section}"
             f"They replied with:\n"
             f'"{trigger_message}"\n\n'
-            f"Write ONE SHORT (1-2 sentences) witty comeback that:\n"
-            f"1. Directly acknowledges what they said — if they're dismissive "
-            f'(e.g. "stfu", "nie", "zostaw mnie"), lean into it with playful '
-            f"sass; if they're positive (e.g. \"ok\", \"przeczytałam\"), "
-            f"celebrate a little but stay in character\n"
-            f'2. Keeps "{book}" in the conversation naturally — '
-            f"don't force it if the reply is very short\n"
-            f"3. Sounds like a real person texting back, not a bot\n"
-            f"4. Takes into account the tone of the conversation so far "
-            f"(visible above) — don't be warmer or colder than the exchange warrants\n\n"
-            f"Tone examples (adapt, don't copy):\n"
-            f'- They said "stfu" → "nie, nie i jeszcze raz nie"\n'
-            f'- They said "ok ok" → "ok ok to za mało, strona minimum"\n'
-            f'- They said "przeczytałam już" → '
-            f'"serio?? ile stron? i co sądzisz?"\n'
-            f'- They said "zostaw mnie" → '
-            f'"nie mogę, {book} by mi tego nie wybaczyła"\n\n'
+            f"Task for this reply: {task}\n\n"
+            f"Write ONE SHORT (1-2 sentences) witty comeback. Sound like a "
+            f"real person texting back, not a bot, and don't be warmer or "
+            f"colder than the conversation shown above warrants.\n\n"
             f"Recent messages you already sent (do not repeat these patterns):\n"
             f"{recent_text}\n\n"
             f"Respond in {language}. Output only the message, nothing else."
