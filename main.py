@@ -2,6 +2,7 @@
 
 import sys
 import time
+from pathlib import Path
 from typing import Optional
 
 from cache_manager import CacheManager
@@ -13,6 +14,20 @@ from scheduler import ReminderScheduler
 
 # Default response-window duration used when the key is absent from config.
 _DEFAULT_RESPONSE_WINDOW_HOURS: float = 3.0
+
+# How often (seconds) to check for a manual trigger file while sleeping
+# between scheduler checks. Keeps manual triggers responsive even when the
+# scheduler's own next check is far away (e.g. hours before the next
+# scheduled reminder).
+_MANUAL_TRIGGER_POLL_SECONDS: int = 5
+
+# Filename (inside the configured cache dir) that, when it exists, causes the
+# app to send a reminder immediately. Create it with e.g.:
+#   touch cache/manual_trigger
+# The file is deleted as soon as it's picked up. Sending this way does NOT
+# touch the scheduler's already-randomized next reminder time — the regular
+# scheduled reminder still fires later as usual.
+_MANUAL_TRIGGER_FILENAME: str = "manual_trigger"
 
 
 class ReminderApp:
@@ -84,6 +99,13 @@ class ReminderApp:
                 "Response window: %.1f h after each sent reminder",
                 self._response_window_hours,
             )
+
+            # Path to the manual-trigger marker file (see module docstring
+            # constant _MANUAL_TRIGGER_FILENAME for how it's used).
+            self._manual_trigger_path: Path = (
+                    self.cache.cache_dir / _MANUAL_TRIGGER_FILENAME
+            )
+
             self.logger.info("All components initialized successfully")
 
         except Exception as exc:
@@ -241,6 +263,87 @@ class ReminderApp:
             else:
                 self.logger.warning("Failed to refill cache")
 
+    def _check_and_clear_manual_trigger(self) -> bool:
+        """Check for a manual-trigger marker file and consume it if present.
+
+        The marker is deleted immediately upon detection so a single
+        ``touch`` only fires one reminder, not one per poll.
+
+        Returns:
+            True if a manual trigger was detected (and has now been cleared).
+        """
+        if not self._manual_trigger_path.exists():
+            return False
+
+        try:
+            self._manual_trigger_path.unlink()
+        except OSError as exc:
+            self.logger.warning(
+                "Manual trigger detected but could not remove marker file "
+                "'%s': %s — proceeding anyway, but it may fire again",
+                self._manual_trigger_path, exc,
+            )
+        return True
+
+    def _send_manual_reminder(self) -> None:
+        """Send a reminder immediately in response to a manual trigger.
+
+        This deliberately does NOT touch ``self.scheduler`` in any way: the
+        already-randomized next scheduled reminder time is left completely
+        untouched, and the "sent today" flag used by the scheduler is not
+        set either. In other words, this is purely an extra, on-demand send
+        — the regular scheduled reminder still fires later exactly as
+        planned.
+
+        Mirrors the success/failure handling of ``_send_reminder()`` (cache
+        bookkeeping, response window, refill) minus anything scheduler-related.
+        """
+        if self._is_sending:
+            self.logger.warning(
+                "Manual trigger received while already sending a reminder — ignoring"
+            )
+            return
+
+        try:
+            self._is_sending = True
+
+            self.logger.info("=" * 60)
+            self.logger.info("Manual trigger detected — sending reminder now")
+
+            message = self.cache.get_oldest_message()
+
+            if not message or not isinstance(message, str) or not message.strip():
+                self.logger.error("No valid cached message available for manual trigger")
+                self.webhook.send_error(
+                    "Manual trigger: cache is empty or invalid, cannot send reminder"
+                )
+                return
+
+            message = message.strip()
+            self.logger.info(
+                "Sending manual reminder: %s",
+                (message[:100] + "...") if len(message) > 100 else message,
+            )
+
+            success = self.webhook.send_reminder(message)
+
+            if success:
+                self.logger.info("✓ Manual reminder sent successfully")
+                self.cache.mark_as_sent(message)
+                self.cache.open_response_window(self._response_window_hours)
+                self._refill_cache()
+            else:
+                self.logger.error("✗ Failed to send manual reminder")
+                self.logger.info("Re-adding message to cache")
+                self.cache.add_message(message)
+
+        except Exception as exc:
+            self.logger.error("Error sending manual reminder: %s", exc)
+            self.webhook.send_error("Error sending manual reminder", exc)
+        finally:
+            self._is_sending = False
+            self.logger.info("=" * 60)
+
     def run(self) -> None:
         """Run the main application loop."""
         try:
@@ -248,6 +351,11 @@ class ReminderApp:
             self.scheduler.schedule_next_reminder()
 
             self.logger.info("Application running. Press Ctrl+C to stop.")
+            self.logger.info(
+                "Manual trigger: run `touch %s` to send a reminder "
+                "immediately — this does not affect the next scheduled time.",
+                self._manual_trigger_path,
+            )
 
             while True:
                 if self.scheduler.should_send_reminder():
@@ -255,8 +363,20 @@ class ReminderApp:
                     success, skipped = self._send_reminder()
                     self.scheduler.report_send_result(success, skipped)
 
-                interval = self.scheduler.get_next_check_interval()
-                time.sleep(interval)
+                if self._check_and_clear_manual_trigger():
+                    self._send_manual_reminder()
+
+                # Sleep in short chunks so a manual trigger is picked up
+                # quickly even when the scheduler's own next check is far
+                # away (e.g. hours before the next scheduled reminder).
+                remaining = self.scheduler.get_next_check_interval()
+                while remaining > 0:
+                    chunk = min(remaining, _MANUAL_TRIGGER_POLL_SECONDS)
+                    time.sleep(chunk)
+                    remaining -= chunk
+
+                    if self._check_and_clear_manual_trigger():
+                        self._send_manual_reminder()
 
         except KeyboardInterrupt:
             self.logger.info("\nApplication stopped by user")
