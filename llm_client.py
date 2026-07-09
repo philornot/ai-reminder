@@ -7,6 +7,14 @@ from typing import Optional
 
 import requests
 
+# Matches any character in the main Cyrillic Unicode block. Used to catch
+# script-mixing glitches where a small/cheap multilingual model slips a
+# Cyrillic transliteration into an otherwise-Latin-script Polish sentence
+# (e.g. writing "балансuje" instead of "balansuje") — Polish and
+# Russian/Ukrainian share a lot of phonetics, which occasionally confuses
+# the model into finishing a word in the wrong alphabet.
+_CYRILLIC_PATTERN = re.compile(r'[\u0400-\u04FF]')
+
 
 class LLMClient:
     """Client for interacting with LLM API to generate messages."""
@@ -76,6 +84,23 @@ class LLMClient:
     def _init_gemini_client(self) -> None:
         """Initialise Gemini client placeholder (uses raw requests, no SDK needed)."""
         self.client = None
+
+    def _contains_cyrillic(self, text: str) -> bool:
+        """Check whether text contains any Cyrillic-script characters.
+
+        Output containing so much as a single Cyrillic character is treated
+        as unreliable rather than "fixed" by stripping just that character —
+        a script-mixing glitch on one word is a sign the completion as a
+        whole may not be trustworthy, so the caller should discard it and
+        ask the LLM again instead of patching it up.
+
+        Args:
+            text: Text to inspect.
+
+        Returns:
+            True if at least one Cyrillic-script character is present.
+        """
+        return bool(_CYRILLIC_PATTERN.search(text))
 
     def _clean_message(self, raw_message: str) -> Optional[str]:
         """Clean and validate LLM output.
@@ -169,33 +194,58 @@ class LLMClient:
 
         return message
 
-    def generate_message(self, prompt: str, max_retries: int = 3) -> Optional[str]:
+    def generate_message(
+            self, prompt: str, max_retries: int = 3, max_cyrillic_retries: int = 2
+    ) -> Optional[str]:
         """Generate a reminder message using LLM.
 
         Runs the raw completion through ``_clean_message()`` to strip
         Markdown formatting, trim overly long output, and drop any
         "Lub:"/"Albo:"-style extra variants some models tack onto the reply.
 
+        Any completion containing Cyrillic-script characters (a script-mixing
+        glitch some smaller multilingual models produce — see
+        ``_contains_cyrillic()``) is discarded and regenerated from scratch,
+        up to ``max_cyrillic_retries`` extra attempts, rather than sent as-is
+        or patched up.
+
         Args:
             prompt: Prompt to send to LLM
             max_retries: Maximum number of retry attempts for API errors
+            max_cyrillic_retries: Maximum number of extra regeneration
+                attempts when the completion contains Cyrillic characters
 
         Returns:
             Generated message or None if failed
         """
-        raw_message = self._generate_raw(prompt, max_retries=max_retries)
-        if not raw_message:
-            return None
+        for cyrillic_attempt in range(max_cyrillic_retries + 1):
+            raw_message = self._generate_raw(prompt, max_retries=max_retries)
+            if not raw_message:
+                return None
 
-        cleaned_message = self._clean_message(raw_message)
-        if not cleaned_message:
-            self.logger.error("Message cleanup failed, rejecting output")
-            return None
+            if self._contains_cyrillic(raw_message):
+                self.logger.warning(
+                    "LLM output contained Cyrillic characters (attempt %d/%d) — "
+                    "discarding and regenerating: %s",
+                    cyrillic_attempt + 1, max_cyrillic_retries + 1, raw_message,
+                )
+                continue
 
-        self.logger.info(
-            "Successfully generated message (%d chars)", len(cleaned_message)
+            cleaned_message = self._clean_message(raw_message)
+            if not cleaned_message:
+                self.logger.error("Message cleanup failed, rejecting output")
+                return None
+
+            self.logger.info(
+                "Successfully generated message (%d chars)", len(cleaned_message)
+            )
+            return cleaned_message
+
+        self.logger.error(
+            "LLM kept producing Cyrillic characters after %d attempt(s) — giving up",
+            max_cyrillic_retries + 1,
         )
-        return cleaned_message
+        return None
 
     def generate_json(self, prompt: str, max_retries: int = 2) -> Optional[dict]:
         """Generate a small structured JSON decision from the LLM.
