@@ -872,19 +872,23 @@ class ContextualReminder:
             True if ``contextual_sent.json`` records today's ISO date.
         """
         today = date.today().isoformat()
-        try:
-            if not self._contextual_sent_path.exists():
+        # contextual_sent.json is also written/read by main.py's CacheManager
+        # (was_contextual_sent_today) in a separate process — share the same
+        # cross-process lock so the two never race on this file.
+        with self._cache.lock():
+            try:
+                if not self._contextual_sent_path.exists():
+                    return False
+                data = json.loads(
+                    self._contextual_sent_path.read_text(encoding="utf-8")
+                )
+                return data.get("last_sent_date") == today
+            except Exception as exc:
+                self.logger.warning(
+                    "Could not read contextual_sent.json: %s — assuming not sent today",
+                    exc,
+                )
                 return False
-            data = json.loads(
-                self._contextual_sent_path.read_text(encoding="utf-8")
-            )
-            return data.get("last_sent_date") == today
-        except Exception as exc:
-            self.logger.warning(
-                "Could not read contextual_sent.json: %s — assuming not sent today",
-                exc,
-            )
-            return False
 
     def _is_within_time_range(self) -> bool:
         """Return True if the current local time is inside the reminder window.
@@ -905,21 +909,22 @@ class ContextualReminder:
     def _mark_sent_today(self) -> None:
         """Persist today's date to ``contextual_sent.json``."""
         today = date.today().isoformat()
-        try:
-            self._contextual_sent_path.parent.mkdir(parents=True, exist_ok=True)
-            self._contextual_sent_path.write_text(
-                json.dumps(
-                    {
-                        "last_sent_date": today,
-                        "sent_at": datetime.now().isoformat(),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-        except Exception as exc:
-            self.logger.warning("Could not write contextual_sent.json: %s", exc)
+        with self._cache.lock():
+            try:
+                self._contextual_sent_path.parent.mkdir(parents=True, exist_ok=True)
+                self._contextual_sent_path.write_text(
+                    json.dumps(
+                        {
+                            "last_sent_date": today,
+                            "sent_at": datetime.now().isoformat(),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except Exception as exc:
+                self.logger.warning("Could not write contextual_sent.json: %s", exc)
 
     # ------------------------------------------------------------------
     # Response-window cooldown helpers
@@ -935,30 +940,31 @@ class ContextualReminder:
         Returns:
             True if the bot is allowed to reply again.
         """
-        try:
-            if not self._response_cooldown_path.exists():
+        with self._cache.lock():
+            try:
+                if not self._response_cooldown_path.exists():
+                    return True
+                data = json.loads(
+                    self._response_cooldown_path.read_text(encoding="utf-8")
+                )
+                last_reply_at = datetime.fromisoformat(data["last_reply_at"])
+                if last_reply_at.tzinfo is None:
+                    last_reply_at = last_reply_at.replace(tzinfo=timezone.utc)
+                elapsed = datetime.now(timezone.utc) - last_reply_at
+                cooldown = timedelta(minutes=self.response_cooldown_minutes)
+                if elapsed >= cooldown:
+                    return True
+                remaining = (cooldown - elapsed).total_seconds() / 60
+                self.logger.debug(
+                    "Response cooldown: %.1f min remaining", remaining
+                )
+                return False
+            except Exception as exc:
+                self.logger.warning(
+                    "Could not read response_cooldown.json: %s — assuming cooldown elapsed",
+                    exc,
+                )
                 return True
-            data = json.loads(
-                self._response_cooldown_path.read_text(encoding="utf-8")
-            )
-            last_reply_at = datetime.fromisoformat(data["last_reply_at"])
-            if last_reply_at.tzinfo is None:
-                last_reply_at = last_reply_at.replace(tzinfo=timezone.utc)
-            elapsed = datetime.now(timezone.utc) - last_reply_at
-            cooldown = timedelta(minutes=self.response_cooldown_minutes)
-            if elapsed >= cooldown:
-                return True
-            remaining = (cooldown - elapsed).total_seconds() / 60
-            self.logger.debug(
-                "Response cooldown: %.1f min remaining", remaining
-            )
-            return False
-        except Exception as exc:
-            self.logger.warning(
-                "Could not read response_cooldown.json: %s — assuming cooldown elapsed",
-                exc,
-            )
-            return True
 
     def _reset_response_cooldown(self) -> None:
         """Write the current UTC timestamp to ``response_cooldown.json``.
@@ -967,24 +973,25 @@ class ContextualReminder:
         the next incoming message is held until the cooldown expires.
         """
         now = datetime.now(timezone.utc)
-        try:
-            self._response_cooldown_path.parent.mkdir(parents=True, exist_ok=True)
-            self._response_cooldown_path.write_text(
-                json.dumps(
-                    {"last_reply_at": now.isoformat()},
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            self.logger.debug(
-                "Response cooldown reset — next reply allowed in %d min",
-                self.response_cooldown_minutes,
-            )
-        except Exception as exc:
-            self.logger.warning(
-                "Could not write response_cooldown.json: %s", exc
-            )
+        with self._cache.lock():
+            try:
+                self._response_cooldown_path.parent.mkdir(parents=True, exist_ok=True)
+                self._response_cooldown_path.write_text(
+                    json.dumps(
+                        {"last_reply_at": now.isoformat()},
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                self.logger.debug(
+                    "Response cooldown reset — next reply allowed in %d min",
+                    self.response_cooldown_minutes,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Could not write response_cooldown.json: %s", exc
+                )
 
     # ------------------------------------------------------------------
     # Reply-reaction helpers
@@ -1008,25 +1015,26 @@ class ContextualReminder:
             message_id: Discord snowflake ID of the message that was just sent.
             content: Text content of that message.
         """
-        try:
-            entries = self._read_reactable_messages()
-            entries.append(
-                {
-                    "message_id": message_id,
-                    "content": content,
-                    "sent_at": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-            if len(entries) > _MAX_REACTABLE_MESSAGES:
-                entries = entries[-_MAX_REACTABLE_MESSAGES:]
+        with self._cache.lock():
+            try:
+                entries = self._read_reactable_messages()
+                entries.append(
+                    {
+                        "message_id": message_id,
+                        "content": content,
+                        "sent_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                if len(entries) > _MAX_REACTABLE_MESSAGES:
+                    entries = entries[-_MAX_REACTABLE_MESSAGES:]
 
-            self._reactable_messages_path.parent.mkdir(parents=True, exist_ok=True)
-            self._reactable_messages_path.write_text(
-                json.dumps(entries, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except Exception as exc:
-            self.logger.warning("Could not persist reactable message id: %s", exc)
+                self._reactable_messages_path.parent.mkdir(parents=True, exist_ok=True)
+                self._reactable_messages_path.write_text(
+                    json.dumps(entries, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception as exc:
+                self.logger.warning("Could not persist reactable message id: %s", exc)
 
     def _read_reactable_messages(self) -> list[dict]:
         """Load the list of bot-sent messages eligible for a reply-reaction.
@@ -1035,15 +1043,16 @@ class ContextualReminder:
             Parsed list of ``{"message_id", "content", "sent_at"}`` entries,
             or an empty list if the file is missing or unreadable.
         """
-        try:
-            if not self._reactable_messages_path.exists():
+        with self._cache.lock():
+            try:
+                if not self._reactable_messages_path.exists():
+                    return []
+                return json.loads(
+                    self._reactable_messages_path.read_text(encoding="utf-8")
+                )
+            except Exception as exc:
+                self.logger.warning("Could not read reactable_messages.json: %s", exc)
                 return []
-            return json.loads(
-                self._reactable_messages_path.read_text(encoding="utf-8")
-            )
-        except Exception as exc:
-            self.logger.warning("Could not read reactable_messages.json: %s", exc)
-            return []
 
     def _get_last_reactable_content(self) -> Optional[str]:
         """Get the content of the most recently sent trackable bot message.

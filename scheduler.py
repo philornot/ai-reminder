@@ -35,6 +35,14 @@ class ReminderScheduler:
         self.range_start = self._parse_time(time_range_start)
         self.range_end = self._parse_time(time_range_end) if randomize else self.range_start
 
+        if randomize and self._to_minutes(self.range_end) < self._to_minutes(self.range_start):
+            raise ValueError(
+                f"reminder.time_range.end ({time_range_end}) is earlier than "
+                f"reminder.time_range.start ({time_range_start}). Overnight "
+                "ranges (e.g. 22:00-02:00) are not supported — pick a range "
+                "that stays within the same day."
+            )
+
         self.next_reminder_time: Optional[datetime] = None
         self._reminder_sent_today = False  # Flag to prevent double sending
 
@@ -42,6 +50,18 @@ class ReminderScheduler:
             self.logger.info(f"Scheduler initialized with random time between {time_range_start} and {time_range_end}")
         else:
             self.logger.info(f"Scheduler initialized with fixed time at {time_range_start}")
+
+    @staticmethod
+    def _to_minutes(t: time) -> int:
+        """Convert a time object to minutes since midnight.
+
+        Args:
+            t: Time object to convert.
+
+        Returns:
+            Number of minutes since 00:00.
+        """
+        return t.hour * 60 + t.minute
 
     def _parse_time(self, time_str: str) -> time:
         """Parse time string in HH:MM format.
@@ -69,8 +89,8 @@ class ReminderScheduler:
             Random datetime within time range
         """
         # Convert time objects to minutes since midnight
-        start_minutes = self.range_start.hour * 60 + self.range_start.minute
-        end_minutes = self.range_end.hour * 60 + self.range_end.minute
+        start_minutes = self._to_minutes(self.range_start)
+        end_minutes = self._to_minutes(self.range_end)
 
         # Generate random minute within range
         random_minutes = random.randint(start_minutes, end_minutes)
@@ -94,32 +114,49 @@ class ReminderScheduler:
     def schedule_next_reminder(self) -> datetime:
         """Schedule the next reminder time.
 
+        If today's slot has already passed but no reminder was actually sent
+        today (e.g. the process was down, crashed, or was only just started
+        after the scheduled time), this catches up by scheduling for "now"
+        instead of silently jumping to tomorrow — otherwise a restart shortly
+        after the target time would cause that day's reminder to be skipped
+        entirely.
+
         Returns:
             Datetime when next reminder should be sent
         """
         today = datetime.now().date()
         tomorrow = today + timedelta(days=1)
+        now = datetime.now()
 
-        # Generate time based on mode
+        # Generate today's slot based on mode
         if self.randomize:
             today_reminder = self._generate_random_time(today)
         else:
             today_reminder = self._generate_fixed_time(today)
 
-        # Check if we can schedule for today
-        now = datetime.now()
-
-        if now < today_reminder and not self._reminder_sent_today:
-            self.next_reminder_time = today_reminder
-        else:
-            # Schedule for tomorrow
+        if self._reminder_sent_today:
+            # Today is already handled (delivered or deliberately skipped) —
+            # move on to tomorrow's slot.
             if self.randomize:
                 self.next_reminder_time = self._generate_random_time(tomorrow)
             else:
                 self.next_reminder_time = self._generate_fixed_time(tomorrow)
-
-            # Reset daily flag when scheduling for tomorrow
             self._reminder_sent_today = False
+        elif now < today_reminder:
+            # Normal case: today's slot hasn't arrived yet.
+            self.next_reminder_time = today_reminder
+        else:
+            # today's slot already passed, but nothing was actually sent
+            # today — most likely the process was down or just (re)started
+            # after the scheduled time. Catch up now rather than skipping
+            # today's reminder entirely.
+            self.next_reminder_time = now
+            self.logger.warning(
+                "Missed today's scheduled reminder time (%s) — the process "
+                "was probably down or just started. Catching up now instead "
+                "of waiting until tomorrow.",
+                today_reminder.strftime("%H:%M:%S"),
+            )
 
         self.logger.info(f"Next reminder scheduled for: {self.next_reminder_time.strftime('%Y-%m-%d %H:%M:%S')}")
         return self.next_reminder_time
@@ -235,4 +272,4 @@ class ReminderScheduler:
             return 60
         # If close, check every 30 seconds (changed from 10 to reduce double-send risk)
         else:
-            return 30
+            return 30	

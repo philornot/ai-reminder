@@ -60,9 +60,44 @@ class Config:
         time_range = self.config["reminder"]["time_range"]
         if "start" not in time_range:
             raise ValueError("Missing reminder.time_range.start")
-        if self.config["reminder"].get("randomize_time", True) and "end" not in time_range:
+        if self.config["reminder"].get("randomize_time", True):
+            if "end" not in time_range:
+                raise ValueError(
+                    "Missing reminder.time_range.end (required when randomize_time is true)"
+                )
+            self._validate_time_order(time_range["start"], time_range["end"])
+
+    @staticmethod
+    def _validate_time_order(start_str: str, end_str: str) -> None:
+        """Ensure the reminder time range does not cross midnight.
+
+        Overnight ranges (e.g. ``22:00``-``02:00``) are not supported by the
+        scheduler, which picks a random time by treating both bounds as
+        minutes-since-midnight on the same day.
+
+        Args:
+            start_str: Range start in ``HH:MM`` format.
+            end_str: Range end in ``HH:MM`` format.
+
+        Raises:
+            ValueError: If the times are not valid ``HH:MM`` strings, or if
+                ``end`` is earlier than ``start``.
+        """
+        try:
+            start_h, start_m = map(int, start_str.split(":"))
+            end_h, end_m = map(int, end_str.split(":"))
+        except (ValueError, AttributeError) as exc:
             raise ValueError(
-                "Missing reminder.time_range.end (required when randomize_time is true)"
+                f"reminder.time_range must use HH:MM format, got "
+                f"start={start_str!r}, end={end_str!r}"
+            ) from exc
+
+        if (end_h * 60 + end_m) < (start_h * 60 + start_m):
+            raise ValueError(
+                f"reminder.time_range.end ({end_str}) is earlier than "
+                f"reminder.time_range.start ({start_str}). Overnight ranges "
+                "(e.g. 22:00-02:00) are not supported — pick a range that "
+                "stays within the same day."
             )
 
         prompt_cfg = self.config["prompt"]
