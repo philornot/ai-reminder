@@ -7,17 +7,108 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional
 
+try:
+    import fcntl
+    _FCNTL_AVAILABLE = True
+except ImportError:
+    # fcntl is POSIX-only. On platforms without it, cross-process locking is
+    # silently skipped and only same-process (threading.RLock) safety holds.
+    _FCNTL_AVAILABLE = False
+
+
+class _InterProcessLock:
+    """Reentrant lock that is also safe across separate OS processes.
+
+    ``main.py`` (the scheduler loop) and ``bot_listener.py`` (via
+    ``ContextualReminder``) run as two independent processes that both read
+    and write the same JSON files in the cache directory. A plain
+    ``threading.RLock`` only protects against concurrent *threads* within a
+    single process — it does nothing to stop the other process from reading
+    or writing the same file at the same moment, which can silently drop an
+    update (e.g. two near-simultaneous ``mark_as_sent()`` calls, one from
+    each process, where the last writer wins and the other's entry is lost).
+
+    This class combines:
+        * a ``threading.RLock`` for cheap, reentrant same-process safety
+          (public methods calling other public methods, e.g.
+          ``get_oldest_message()`` → ``get_cache_count()``), and
+        * an ``fcntl.flock()`` on a dedicated lock file for cross-process
+          mutual exclusion.
+
+    The OS-level flock is only acquired/released on the outermost
+    lock/unlock (depth 0 → 1 and 1 → 0); nested/reentrant acquisitions within
+    the same process just bump a counter. This avoids a self-deadlock that
+    would otherwise happen if the same process tried to flock() the same
+    file twice via two different file descriptors.
+
+    Falls back to thread-only safety (with a one-time warning) on platforms
+    without ``fcntl`` (i.e. non-POSIX systems).
+    """
+
+    def __init__(self, lock_path: Path, logger: logging.Logger):
+        """Initialize the lock.
+
+        Args:
+            lock_path: Path to the dedicated lock file (created if missing).
+            logger: Logger instance used for one-time warnings.
+        """
+        self._lock_path = lock_path
+        self._logger = logger
+        self._thread_lock = threading.RLock()
+        self._depth = 0
+        self._fd = None
+
+        if _FCNTL_AVAILABLE:
+            self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+            # Opened once and kept open for the lifetime of this object so
+            # repeated flock() calls always target the same open file
+            # description (required for correct reentrancy bookkeeping).
+            self._fd = open(self._lock_path, "a+")
+        else:
+            self._logger.warning(
+                "fcntl not available on this platform — cache file locking "
+                "is limited to within-process only. Running main.py and "
+                "bot_listener.py against the same cache directory "
+                "concurrently may lose updates."
+            )
+
+    def acquire(self) -> None:
+        """Acquire the lock, blocking until available."""
+        self._thread_lock.acquire()
+        if self._fd is not None and self._depth == 0:
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+        self._depth += 1
+
+    def release(self) -> None:
+        """Release the lock."""
+        self._depth -= 1
+        if self._fd is not None and self._depth == 0:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        self._thread_lock.release()
+
+    def __enter__(self) -> "_InterProcessLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.release()
+
 
 class CacheManager:
     """Manager for caching AI-generated messages.
 
-    All public methods are thread-safe. A single reentrant lock guards every
-    read-modify-write operation so concurrent callers (e.g. a background
-    refill thread and the main send loop) cannot corrupt the JSON files.
+    All public methods are safe to call concurrently — both from multiple
+    threads within one process, and from ``main.py`` and ``bot_listener.py``
+    running as separate OS processes against the same cache directory. A
+    single lock (``_InterProcessLock``, combining a reentrant thread lock
+    with a cross-process ``flock``) guards every read-modify-write operation
+    so concurrent callers cannot corrupt the JSON files or silently drop
+    each other's updates.
     """
 
     _CONTEXTUAL_SENT_FILENAME = "contextual_sent.json"
     _RESPONSE_WINDOW_FILENAME = "response_window.json"
+    _LOCK_FILENAME = ".cache.lock"
 
     def __init__(
             self,
@@ -36,11 +127,15 @@ class CacheManager:
         self.cache_size = cache_size
         self.logger = logger or logging.getLogger(__name__)
 
-        # RLock so that public methods can safely call other public methods
-        # without deadlocking (e.g. get_oldest_message → get_cache_count).
-        self._lock = threading.RLock()
-
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Combined reentrant + cross-process lock so that main.py and
+        # bot_listener.py (via ContextualReminder), which run as separate
+        # processes sharing this same cache directory, cannot clobber each
+        # other's writes to messages.json / sent_messages.json / etc.
+        self._lock = _InterProcessLock(
+            self.cache_dir / self._LOCK_FILENAME, self.logger
+        )
 
         self.cache_file = self.cache_dir / "messages.json"
         self.sent_file = self.cache_dir / "sent_messages.json"
@@ -153,6 +248,24 @@ class CacheManager:
     # ------------------------------------------------------------------
     # Public API – every method acquires the lock for its entire operation
     # ------------------------------------------------------------------
+
+    def lock(self) -> _InterProcessLock:
+        """Return the shared cross-process/cross-thread lock for this cache dir.
+
+        Intended for callers outside ``CacheManager`` (currently
+        ``ContextualReminder``) that read or write other files in the same
+        cache directory (``contextual_sent.json``, ``response_cooldown.json``,
+        ``reactable_messages.json``) and need to serialise those accesses
+        against ``main.py``'s ``CacheManager`` operations too, since both
+        processes share the same directory. Use as a context manager::
+
+            with cache.lock():
+                ...read/write a file in cache.cache_dir...
+
+        Returns:
+            The ``_InterProcessLock`` instance guarding this cache directory.
+        """
+        return self._lock
 
     def get_recent_sent_messages(self, count: int = 5) -> List[str]:
         """Return the most recently sent messages for LLM context.
@@ -360,19 +473,20 @@ class CacheManager:
         contextual_sent_path = self.cache_dir / self._CONTEXTUAL_SENT_FILENAME
         today = date.today().isoformat()
 
-        try:
-            if not contextual_sent_path.exists():
+        with self._lock:
+            try:
+                if not contextual_sent_path.exists():
+                    return False
+                with open(contextual_sent_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data.get("last_sent_date") == today
+            except Exception as exc:
+                self.logger.warning(
+                    "Could not read %s: %s — assuming no contextual reminder sent today",
+                    contextual_sent_path,
+                    exc,
+                )
                 return False
-            with open(contextual_sent_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data.get("last_sent_date") == today
-        except Exception as exc:
-            self.logger.warning(
-                "Could not read %s: %s — assuming no contextual reminder sent today",
-                contextual_sent_path,
-                exc,
-            )
-            return False
 
     # ------------------------------------------------------------------
     # Response-window API
@@ -401,26 +515,27 @@ class CacheManager:
         expires_at = (now + timedelta(hours=duration_hours)).isoformat()
 
         path = self.cache_dir / self._RESPONSE_WINDOW_FILENAME
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(
-                    {
-                        "opened_at": now.isoformat(),
-                        "expires_at": expires_at,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            self.logger.info(
-                "Response window opened — expires at %s (%.1f h)",
-                expires_at,
-                duration_hours,
-            )
-        except Exception as exc:
-            self.logger.warning("Could not write response_window.json: %s", exc)
+        with self._lock:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    json.dumps(
+                        {
+                            "opened_at": now.isoformat(),
+                            "expires_at": expires_at,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                self.logger.info(
+                    "Response window opened — expires at %s (%.1f h)",
+                    expires_at,
+                    duration_hours,
+                )
+            except Exception as exc:
+                self.logger.warning("Could not write response_window.json: %s", exc)
 
     def is_response_window_open(self) -> bool:
         """Return True when a response window is currently active.
@@ -435,22 +550,23 @@ class CacheManager:
         from datetime import timezone
 
         path = self.cache_dir / self._RESPONSE_WINDOW_FILENAME
-        try:
-            if not path.exists():
+        with self._lock:
+            try:
+                if not path.exists():
+                    return False
+                data = json.loads(path.read_text(encoding="utf-8"))
+                expires_at = datetime.fromisoformat(data["expires_at"])
+                now = datetime.now(timezone.utc)
+                # Normalise naive datetimes (e.g. written without tz by old code) to UTC.
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                return now < expires_at
+            except Exception as exc:
+                self.logger.warning(
+                    "Could not read response_window.json: %s — treating window as closed",
+                    exc,
+                )
                 return False
-            data = json.loads(path.read_text(encoding="utf-8"))
-            expires_at = datetime.fromisoformat(data["expires_at"])
-            now = datetime.now(timezone.utc)
-            # Normalise naive datetimes (e.g. written without tz by old code) to UTC.
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-            return now < expires_at
-        except Exception as exc:
-            self.logger.warning(
-                "Could not read response_window.json: %s — treating window as closed",
-                exc,
-            )
-            return False
 
     def close_response_window(self) -> None:
         """Explicitly close the response window before it naturally expires.
@@ -459,9 +575,10 @@ class CacheManager:
         elapsed and it decides not to reply again within the same window.
         """
         path = self.cache_dir / self._RESPONSE_WINDOW_FILENAME
-        try:
-            if path.exists():
-                path.unlink()
-                self.logger.info("Response window closed")
-        except Exception as exc:
-            self.logger.warning("Could not remove response_window.json: %s", exc)
+        with self._lock:
+            try:
+                if path.exists():
+                    path.unlink()
+                    self.logger.info("Response window closed")
+            except Exception as exc:
+                self.logger.warning("Could not remove response_window.json: %s", exc)
