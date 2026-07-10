@@ -26,13 +26,14 @@ Three operating modes
 
 Reply reactions
 ----------------
-Independently of the three modes above: whenever the target uses Discord's
-native "reply" feature to answer one of the bot's own sent messages (mention,
-contextual, or response-window), the module asks the LLM a small yes/no
-question — does adding an emoji reaction actually fit here, or would it look
-tone-deaf (e.g. the bot's message landed in the middle of an unrelated
-conversation and the "reply" isn't really engaging with it)? Only when the
-LLM says yes does the bot add a reaction, picking one emoji from a small
+Independently of the three modes above: whenever the target sends a message
+that's plausibly answering one of the bot's own sent messages (mention,
+contextual, or response-window) — either an explicit Discord "reply", or
+simply the next thing they write shortly after — the module asks the LLM a
+small yes/no question: does adding an emoji reaction actually fit here, or
+would it look tone-deaf (e.g. the bot's message landed in the middle of an
+unrelated conversation the target is really continuing)? Only when the LLM
+says yes does the bot add a reaction, picking one emoji from a small
 hardcoded pool (see ``_REACTION_EMOJI_CHOICES``). This runs as a best-effort
 background task and never blocks or affects the normal reply-generation flow.
 
@@ -179,7 +180,19 @@ _REACTION_EMOJI_CHOICES: dict[str, str] = {
 
 # Hard cap on how many sent messages we keep track of as "reactable" (i.e.
 # eligible for a reply-reaction). Old entries are dropped first.
-_MAX_REACTABLE_MESSAGES: int = 50
+_MAX_REACTABLE_MESSAGES: int = 25
+
+# When the target's message isn't an explicit Discord reply, we fall back to
+# "the last message the bot sent" as the thing they're presumably answering.
+# This window bounds how stale that last message may be before we stop
+# treating an unrelated later message as a response to it.
+_REACTABLE_LOOKBACK_MINUTES: int = 30
+
+# How many messages of surrounding channel history to show the LLM when
+# deciding whether a reaction fits. Two isolated sentences (the bot's message
+# + the target's reply) can't reveal that the bot's message actually
+# interrupted an unrelated conversation — this gives it enough to notice.
+_REACTION_CONTEXT_LIMIT: int = 10
 
 
 @dataclass
@@ -476,19 +489,26 @@ class ContextualReminder:
 
         # ------------------------------------------------------------------
         # Reply-reaction check — independent of the mode logic below.
-        # Only fires when the target used Discord's native "reply" feature
-        # and the message they replied to is one this bot actually sent.
+        # Fires on any message from the target as long as there's a recently
+        # sent bot message to react to; an explicit Discord "reply" link is
+        # used when present (more precise about *what* is being answered),
+        # but is no longer required — the target answering in plain text
+        # right after the bot's message counts too.
         # Runs in the background so it can never delay or break the normal
         # reply-generation flow (see _maybe_react_to_reply's own try/except).
         # ------------------------------------------------------------------
+        replied_to_content: Optional[str] = None
         if message.reference is not None and message.reference.message_id is not None:
             replied_to_content = self._find_reactable_content(message.reference.message_id)
-            if replied_to_content is not None:
-                task = asyncio.create_task(
-                    self._maybe_react_to_reply(message, trigger_content, replied_to_content)
-                )
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
+        if replied_to_content is None:
+            replied_to_content = self._get_last_reactable_content()
+
+        if replied_to_content is not None:
+            task = asyncio.create_task(
+                self._maybe_react_to_reply(message, trigger_content, replied_to_content)
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
         # ------------------------------------------------------------------
         # Determine mode without the lock (full re-check happens inside)
@@ -974,11 +994,12 @@ class ContextualReminder:
         """Record a just-sent message as eligible for a future reply-reaction.
 
         Persisted to ``reactable_messages.json`` in the ai-reminder cache
-        directory so that when the target later replies to it using
-        Discord's native reply feature, ``handle_message()`` can recognise
-        which message they replied to and hand it off to the LLM for a
-        react/don't-react decision. The content is stored alongside the ID
-        so that decision doesn't need an extra Discord API round trip later.
+        directory so that when the target later responds to it — via an
+        explicit Discord reply, or just by writing again shortly after —
+        ``handle_message()`` can recognise which message it was and hand it
+        off to the LLM for a react/don't-react decision. The content is
+        stored alongside the ID so that decision doesn't need an extra
+        Discord API round trip later.
 
         The list is capped at ``_MAX_REACTABLE_MESSAGES`` entries (oldest
         dropped first) so the file cannot grow without bound.
@@ -1024,6 +1045,35 @@ class ContextualReminder:
             self.logger.warning("Could not read reactable_messages.json: %s", exc)
             return []
 
+    def _get_last_reactable_content(self) -> Optional[str]:
+        """Get the content of the most recently sent trackable bot message.
+
+        Used as a fallback when the target's message isn't an explicit
+        Discord reply: we still treat it as a plausible response to "whatever
+        the bot last said", as long as that message is recent enough (see
+        ``_REACTABLE_LOOKBACK_MINUTES``) to make that a reasonable guess.
+
+        Returns:
+            The most recent tracked message's text, or None if there isn't
+            one or it's older than the lookback window.
+        """
+        entries = self._read_reactable_messages()
+        if not entries:
+            return None
+
+        last_entry = entries[-1]
+        sent_at_raw = last_entry.get("sent_at")
+        try:
+            sent_at = datetime.fromisoformat(sent_at_raw)
+        except (TypeError, ValueError):
+            return None
+
+        age = datetime.now(timezone.utc) - sent_at
+        if age > timedelta(minutes=_REACTABLE_LOOKBACK_MINUTES):
+            return None
+
+        return last_entry.get("content")
+
     def _find_reactable_content(self, message_id: int) -> Optional[str]:
         """Look up the text of a tracked bot-sent message by its Discord ID.
 
@@ -1040,8 +1090,57 @@ class ContextualReminder:
                 return entry.get("content")
         return None
 
+    async def _fetch_recent_channel_messages(
+            self, trigger_message: discord.Message, limit: int = _REACTION_CONTEXT_LIMIT
+    ) -> _ConversationContext:
+        """Fetch the last few channel messages before trigger_message.
+
+        A flat, simple history read — unlike ``_fetch_conversation_context()``
+        this doesn't try to anchor on the bot's last message, it just grabs
+        "whatever was said recently". Used to give the reply-reaction
+        decision enough surrounding context to notice when the bot's message
+        actually interrupted an unrelated conversation, which the bot's
+        message and the target's reply alone can't show.
+
+        Args:
+            trigger_message: The message to fetch history before.
+            limit: Maximum number of prior messages to fetch.
+
+        Returns:
+            A ``_ConversationContext`` with up to ``limit`` messages, oldest
+            first, or an empty one if history couldn't be read.
+        """
+        channel = trigger_message.channel
+        collected: list[tuple[str, str]] = []
+
+        try:
+            async for msg in channel.history(limit=limit, before=trigger_message):
+                content = (msg.content or "").strip()
+                if not content:
+                    continue
+                author_name = (
+                        msg.author.display_name or msg.author.name or str(msg.author.id)
+                )
+                collected.append((author_name, content))
+        except discord.Forbidden:
+            self.logger.warning(
+                "Cannot read history in channel %s for reaction context — "
+                "missing Read Message History permission",
+                getattr(channel, "name", channel.id),
+            )
+        except discord.HTTPException as exc:
+            self.logger.warning(
+                "Failed to fetch channel history for reaction context: %s", exc
+            )
+
+        collected.reverse()
+        return _ConversationContext(messages=collected, bot_message_found=False)
+
     def _build_reaction_decision_prompt(
-            self, reply_content: str, replied_to_content: str
+            self,
+            reply_content: str,
+            replied_to_content: str,
+            context: _ConversationContext,
     ) -> str:
         """Build a prompt asking the LLM whether a reaction fits this reply.
 
@@ -1054,6 +1153,9 @@ class ContextualReminder:
         Args:
             reply_content: Stripped text of the target's Discord reply.
             replied_to_content: Text of the bot's message being replied to.
+            context: Recent surrounding channel history, so the LLM can spot
+                whether the bot's message actually interrupted an unrelated
+                conversation.
 
         Returns:
             Fully formatted prompt string ready to be sent to the LLM.
@@ -1064,18 +1166,19 @@ class ContextualReminder:
         )
 
         return (
-            f"You sent {target} this Discord message:\n"
+            f"Recent conversation in the channel (most recent last):\n"
+            f"{context.format_for_prompt()}\n\n"
+            f"You (the bot) then sent {target} this message:\n"
             f'"{replied_to_content}"\n\n'
-            f"{target} used Discord's reply feature to respond directly to "
-            f"it, writing:\n"
+            f"{target} then wrote this, plausibly in response to it:\n"
             f'"{reply_content}"\n\n'
-            "Decide whether adding an emoji reaction to their reply would "
-            "feel natural here, the way a person casually reacts to a text "
-            "message. Say no if the reply is long, serious, sensitive, or "
-            "reads like it's actually continuing a different conversation "
-            "your message just interrupted rather than genuinely engaging "
-            "with it — a reaction would look tone-deaf or inattentive "
-            "there.\n\n"
+            "Using the conversation above for context, decide whether adding "
+            "an emoji reaction to that message would feel natural here, the "
+            "way a person casually reacts to a text message. Say no if the "
+            "message is long, serious, sensitive, or reads like it's "
+            "actually part of a different conversation your message just "
+            "interrupted rather than genuinely engaging with it — a "
+            "reaction would look tone-deaf or inattentive there.\n\n"
             "If you do react, choose ONLY one name from this list:\n"
             f"{emoji_list}\n\n"
             "Respond with ONLY a single compact JSON object and nothing "
@@ -1092,21 +1195,25 @@ class ContextualReminder:
     ) -> None:
         """Ask the LLM whether an emoji reaction fits, and add it if so.
 
-        Runs as a fire-and-forget background task whenever the target uses
-        Discord's native reply feature to respond directly to one of the
-        bot's own tracked messages. Reacting is treated as an optional,
+        Runs as a fire-and-forget background task whenever the target sends
+        a message that plausibly answers one of the bot's own tracked
+        messages — either an explicit Discord reply, or simply their next
+        message shortly after. Reacting is treated as an optional,
         low-stakes flourish, so any failure in this path (LLM call, JSON
         parsing, Discord API) is logged and swallowed rather than raised —
         it must never affect the main reply-generation flow in
         ``handle_message()``.
 
         Args:
-            message: The target's reply message (the one to react to).
-            reply_content: Stripped text content of the target's reply.
-            replied_to_content: Text of the bot's message that was replied to.
+            message: The target's message (the one to react to).
+            reply_content: Stripped text content of the target's message.
+            replied_to_content: Text of the bot's message it's answering.
         """
         try:
-            prompt = self._build_reaction_decision_prompt(reply_content, replied_to_content)
+            context = await self._fetch_recent_channel_messages(message)
+            prompt = self._build_reaction_decision_prompt(
+                reply_content, replied_to_content, context
+            )
 
             loop = asyncio.get_running_loop()
             decision: Optional[dict] = await loop.run_in_executor(
