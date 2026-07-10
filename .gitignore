@@ -1,10 +1,14 @@
 /.venv
+/venv
 /logs
 /cache
 /.idea
+/__pycache__
 
 config/config.yaml
 config/config_listener.yaml
 
 systemd/ai-reminder.service
 systemd/bot-listener.service
+
+*.log
