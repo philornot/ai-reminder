@@ -67,6 +67,21 @@ class Config:
                 )
             self._validate_time_order(time_range["start"], time_range["end"])
 
+        prompt_cfg = self.config["prompt"]
+        if isinstance(prompt_cfg, dict):
+            if "base" not in prompt_cfg:
+                raise ValueError("Missing prompt.base")
+            if "tasks" not in prompt_cfg or not prompt_cfg["tasks"]:
+                raise ValueError(
+                    "Missing prompt.tasks (must be a non-empty list of task "
+                    "variants when 'prompt' is a dict)"
+                )
+        elif not isinstance(prompt_cfg, str):
+            raise ValueError(
+                "prompt must be either a plain string template, or a dict "
+                "with 'base' and 'tasks' keys"
+            )
+
     @staticmethod
     def _validate_time_order(start_str: str, end_str: str) -> None:
         """Ensure the reminder time range does not cross midnight.
@@ -98,21 +113,6 @@ class Config:
                 f"reminder.time_range.start ({start_str}). Overnight ranges "
                 "(e.g. 22:00-02:00) are not supported — pick a range that "
                 "stays within the same day."
-            )
-
-        prompt_cfg = self.config["prompt"]
-        if isinstance(prompt_cfg, dict):
-            if "base" not in prompt_cfg:
-                raise ValueError("Missing prompt.base")
-            if "tasks" not in prompt_cfg or not prompt_cfg["tasks"]:
-                raise ValueError(
-                    "Missing prompt.tasks (must be a non-empty list of task "
-                    "variants when 'prompt' is a dict)"
-                )
-        elif not isinstance(prompt_cfg, str):
-            raise ValueError(
-                "prompt must be either a plain string template, or a dict "
-                "with 'base' and 'tasks' keys"
             )
 
     def get(self, key: str, default: Any = None) -> Any:
