@@ -178,6 +178,28 @@ _REACTION_EMOJI_CHOICES: dict[str, str] = {
     "heart": "❤️",
 }
 
+# Short human-readable meaning for each emoji, shown to the LLM alongside the
+# character itself. Small/quick models otherwise tend to pick an emoji based
+# on a vague vibe rather than its actual meaning — most notably reaching for
+# ``joy`` (😂, "laughing/crying with laughter", i.e. LOL) any time something
+# is merely pleasant or nice, when that emoji specifically signals something
+# was FUNNY, not that it made someone happy or proud. Spelling these out
+# keeps the picked emoji aligned with what it actually communicates.
+_REACTION_EMOJI_MEANINGS: dict[str, str] = {
+    "flushed": "something unexpected, absurd or embarrassing",
+    "eyes": "suspicious or intrigued side-eye, \"I see you\" / \"spill the tea\"",
+    "joy": "laughing-crying at something FUNNY (LOL). NOT the same as being "
+           "happy, glad, proud, or pleased — never use it for good news or "
+           "compliments, only for genuine humor",
+    "skull": "\"I'm dead\", something so funny or unhinged it killed you — dark/exaggerated humor",
+    "thinking": "considering, skeptical, or mildly doubtful — a raised-eyebrow \"hmm\"",
+    "salute": "respect, acknowledgement, \"got it\" / \"o7\" — earnest, not sarcastic",
+    "melting_face": "cringing or dying of secondhand embarrassment (or heat) — awkward, not sad",
+    "sob": "genuinely moved, touched, or sad — crying for real, not laughing",
+    "fire": "impressed, \"that's awesome\" / \"this slaps\"",
+    "heart": "genuine warmth or affection",
+}
+
 # Hard cap on how many sent messages we keep track of as "reactable" (i.e.
 # eligible for a reply-reaction). Old entries are dropped first.
 _MAX_REACTABLE_MESSAGES: int = 25
@@ -497,13 +519,20 @@ class ContextualReminder:
         # Runs in the background so it can never delay or break the normal
         # reply-generation flow (see _maybe_react_to_reply's own try/except).
         # ------------------------------------------------------------------
-        replied_to_content: Optional[str] = None
+        reactable_match: Optional[tuple[int, str]] = None
         if message.reference is not None and message.reference.message_id is not None:
-            replied_to_content = self._find_reactable_content(message.reference.message_id)
-        if replied_to_content is None:
-            replied_to_content = self._get_last_reactable_content()
+            reactable_match = self._find_reactable_content(message.reference.message_id)
+        if reactable_match is None:
+            reactable_match = self._get_last_reactable_content()
 
-        if replied_to_content is not None:
+        if reactable_match is not None:
+            reactable_message_id, replied_to_content = reactable_match
+            # Consume immediately (synchronously, before the background task
+            # even starts) so a burst of several messages from the target
+            # can only ever match this bot message once — the reaction (or
+            # no-react decision) attaches to this single message only, never
+            # to subsequent ones.
+            self._mark_reactable_consumed(reactable_message_id)
             task = asyncio.create_task(
                 self._maybe_react_to_reply(message, trigger_content, replied_to_content)
             )
@@ -1023,6 +1052,11 @@ class ContextualReminder:
                         "message_id": message_id,
                         "content": content,
                         "sent_at": datetime.now(timezone.utc).isoformat(),
+                        # Set once this message has been picked as "the one
+                        # being answered" for a reply-reaction decision, so
+                        # it can't be picked again for a later message from
+                        # the target (see _mark_reactable_consumed).
+                        "consumed": False,
                     }
                 )
                 if len(entries) > _MAX_REACTABLE_MESSAGES:
@@ -1054,23 +1088,33 @@ class ContextualReminder:
                 self.logger.warning("Could not read reactable_messages.json: %s", exc)
                 return []
 
-    def _get_last_reactable_content(self) -> Optional[str]:
-        """Get the content of the most recently sent trackable bot message.
+    def _get_last_reactable_content(self) -> Optional[tuple[int, str]]:
+        """Get the most recently sent, not-yet-consumed trackable bot message.
 
         Used as a fallback when the target's message isn't an explicit
         Discord reply: we still treat it as a plausible response to "whatever
         the bot last said", as long as that message is recent enough (see
         ``_REACTABLE_LOOKBACK_MINUTES``) to make that a reasonable guess.
 
+        Entries already marked ``consumed`` are skipped — a single bot
+        message may only be treated as "being answered" once, so that a
+        reaction (or a no-react decision) only ever attaches to the first
+        target message that follows it, not to every message the target
+        sends afterwards. See ``_mark_reactable_consumed``.
+
         Returns:
-            The most recent tracked message's text, or None if there isn't
-            one or it's older than the lookback window.
+            A ``(message_id, content)`` tuple for the most recent eligible
+            tracked message, or None if there isn't one, it's already been
+            consumed, or it's older than the lookback window.
         """
         entries = self._read_reactable_messages()
         if not entries:
             return None
 
         last_entry = entries[-1]
+        if last_entry.get("consumed"):
+            return None
+
         sent_at_raw = last_entry.get("sent_at")
         try:
             sent_at = datetime.fromisoformat(sent_at_raw)
@@ -1081,23 +1125,66 @@ class ContextualReminder:
         if age > timedelta(minutes=_REACTABLE_LOOKBACK_MINUTES):
             return None
 
-        return last_entry.get("content")
+        message_id = last_entry.get("message_id")
+        content = last_entry.get("content")
+        if message_id is None or content is None:
+            return None
+        return message_id, content
 
-    def _find_reactable_content(self, message_id: int) -> Optional[str]:
-        """Look up the text of a tracked bot-sent message by its Discord ID.
+    def _find_reactable_content(self, message_id: int) -> Optional[tuple[int, str]]:
+        """Look up the text of a tracked, not-yet-consumed bot-sent message.
 
         Args:
             message_id: Discord snowflake ID, typically taken from
                 ``message.reference.message_id`` on an incoming reply.
 
         Returns:
-            The original message's text if it is one the bot sent and is
-            still tracked, otherwise None.
+            A ``(message_id, content)`` tuple if it is one the bot sent, is
+            still tracked, and hasn't already been consumed by an earlier
+            reply-reaction decision; otherwise None.
         """
         for entry in self._read_reactable_messages():
             if entry.get("message_id") == message_id:
-                return entry.get("content")
+                if entry.get("consumed"):
+                    return None
+                content = entry.get("content")
+                if content is None:
+                    return None
+                return message_id, content
         return None
+
+    def _mark_reactable_consumed(self, message_id: int) -> None:
+        """Mark a tracked bot message as already used for a reaction decision.
+
+        Called as soon as a target message is matched to a reactable bot
+        message — *before* the (async, best-effort) react/don't-react
+        decision even runs — so that a burst of several messages from the
+        target right after a single bot message can only ever trigger one
+        reply-reaction decision, tied to the first of those messages, rather
+        than one decision (and potentially one reaction) per message.
+
+        Args:
+            message_id: Discord snowflake ID of the bot message that was
+                matched as "the one being answered".
+        """
+        with self._cache.lock():
+            try:
+                entries = self._read_reactable_messages()
+                changed = False
+                for entry in entries:
+                    if entry.get("message_id") == message_id and not entry.get("consumed"):
+                        entry["consumed"] = True
+                        changed = True
+                        break
+                if not changed:
+                    return
+                self._reactable_messages_path.parent.mkdir(parents=True, exist_ok=True)
+                self._reactable_messages_path.write_text(
+                    json.dumps(entries, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception as exc:
+                self.logger.warning("Could not mark reactable message consumed: %s", exc)
 
     async def _fetch_recent_channel_messages(
             self, trigger_message: discord.Message, limit: int = _REACTION_CONTEXT_LIMIT
@@ -1171,7 +1258,8 @@ class ContextualReminder:
         """
         target = self._ai_config.get("reminder.target_name", "target")
         emoji_list = "\n".join(
-            f"- {name}: {char}" for name, char in _REACTION_EMOJI_CHOICES.items()
+            f"- {name}: {char} — {_REACTION_EMOJI_MEANINGS.get(name, '')}"
+            for name, char in _REACTION_EMOJI_CHOICES.items()
         )
 
         return (
@@ -1188,7 +1276,10 @@ class ContextualReminder:
             "actually part of a different conversation your message just "
             "interrupted rather than genuinely engaging with it — a "
             "reaction would look tone-deaf or inattentive there.\n\n"
-            "If you do react, choose ONLY one name from this list:\n"
+            "If you do react, choose ONLY one name from this list, and pick "
+            "based on its actual meaning below, not just a general good/bad "
+            "vibe (e.g. \"joy\" means laughing at something funny — do not "
+            "pick it just because the moment is positive or nice):\n"
             f"{emoji_list}\n\n"
             "Respond with ONLY a single compact JSON object and nothing "
             "else, in exactly one of these two shapes:\n"
