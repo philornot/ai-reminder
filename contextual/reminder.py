@@ -72,6 +72,20 @@ Optional config keys (under ``contextual_reminder``):
     context_message_limit (int): Maximum number of messages to include as
         conversation context (hard cap regardless of bot-message search).
         Default: 20.
+    enable_mention_mode (bool): Whether a direct ping (``@bot`` or one of its
+        roles) triggers an immediate reply, bypassing the time window,
+        daily-sent state, and response cooldown. Default: true.
+    enable_reactions (bool): Master switch for the reply-reaction feature
+        (see ``contextual.reactions``). When false, the bot never tracks
+        its own sent messages as "reactable" and never asks the LLM for a
+        react/don't-react decision — saves the extra LLM call and avoids
+        needing the "Add Reactions" Discord permission. Default: true.
+    reactable_lookback_minutes (int): How stale the bot's last tracked
+        message may be before a target message that isn't an explicit
+        Discord reply stops counting as a plausible response to it.
+        Default: 30.
+    reaction_context_limit (int): How many surrounding channel messages to
+        show the LLM when deciding whether a reaction fits. Default: 10.
 
 IMPORTANT — Discord privileged intent:
     Reading message content requires the **Message Content** privileged intent.
@@ -106,6 +120,8 @@ from .conditions import _ConditionsMixin
 from .constants import (
     _CONTEXT_FALLBACK_LIMIT,
     _DEFAULT_CONTEXT_MESSAGE_LIMIT,
+    _DEFAULT_REACTABLE_LOOKBACK_MINUTES,
+    _DEFAULT_REACTION_CONTEXT_LIMIT,
     _DEFAULT_RESPONSE_COOLDOWN_MINUTES,
     _GENERATION_LOCK_TIMEOUT_S,
     _HISTORY_FETCH_LIMIT,
@@ -196,6 +212,14 @@ class ContextualReminder(
         self.context_message_limit: int = int(
             cfg.get("context_message_limit", _DEFAULT_CONTEXT_MESSAGE_LIMIT)
         )
+        self.enable_mention_mode: bool = bool(cfg.get("enable_mention_mode", True))
+        self.enable_reactions: bool = bool(cfg.get("enable_reactions", True))
+        self.reactable_lookback_minutes: int = int(
+            cfg.get("reactable_lookback_minutes", _DEFAULT_REACTABLE_LOOKBACK_MINUTES)
+        )
+        self.reaction_context_limit: int = int(
+            cfg.get("reaction_context_limit", _DEFAULT_REACTION_CONTEXT_LIMIT)
+        )
 
         # One generation at a time — prevents double-send when the target
         # sends a burst of messages before the first reply is marked as sent.
@@ -277,11 +301,20 @@ class ContextualReminder(
 
         self.logger.info(
             "Contextual reminder: enabled (watching user_id=%d%s, "
-            "response_cooldown=%d min, context_limit=%d messages)",
+            "response_cooldown=%d min, context_limit=%d messages, "
+            "mention_mode=%s, reactions=%s%s)",
             self.target_discord_id,
             f", channel_id={self.channel_id}" if self.channel_id else " in all channels",
             self.response_cooldown_minutes,
             self.context_message_limit,
+            self.enable_mention_mode,
+            self.enable_reactions,
+            (
+                f", reactable_lookback={self.reactable_lookback_minutes} min, "
+                f"reaction_context={self.reaction_context_limit} messages"
+                if self.enable_reactions
+                else ""
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -321,8 +354,12 @@ class ContextualReminder(
 
         Returns:
             True if the bot was mentioned directly, or if the message pings
-            a role that the bot currently has in that guild.
+            a role that the bot currently has in that guild. Always False
+            when ``enable_mention_mode`` is off in config.
         """
+        if not self.enable_mention_mode:
+            return False
+
         if self._bot_user is None:
             return False
 
@@ -389,26 +426,29 @@ class ContextualReminder(
         # right after the bot's message counts too.
         # Runs in the background so it can never delay or break the normal
         # reply-generation flow (see _maybe_react_to_reply's own try/except).
+        # Skipped entirely when enable_reactions is off in config — no
+        # tracking, no matching, no LLM call, no Discord reaction.
         # ------------------------------------------------------------------
-        reactable_match: Optional[tuple[int, str]] = None
-        if message.reference is not None and message.reference.message_id is not None:
-            reactable_match = self._find_reactable_content(message.reference.message_id)
-        if reactable_match is None:
-            reactable_match = self._get_last_reactable_content()
+        if self.enable_reactions:
+            reactable_match: Optional[tuple[int, str]] = None
+            if message.reference is not None and message.reference.message_id is not None:
+                reactable_match = self._find_reactable_content(message.reference.message_id)
+            if reactable_match is None:
+                reactable_match = self._get_last_reactable_content()
 
-        if reactable_match is not None:
-            reactable_message_id, replied_to_content = reactable_match
-            # Consume immediately (synchronously, before the background task
-            # even starts) so a burst of several messages from the target
-            # can only ever match this bot message once — the reaction (or
-            # no-react decision) attaches to this single message only, never
-            # to subsequent ones.
-            self._mark_reactable_consumed(reactable_message_id)
-            task = asyncio.create_task(
-                self._maybe_react_to_reply(message, trigger_content, replied_to_content)
-            )
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
+            if reactable_match is not None:
+                reactable_message_id, replied_to_content = reactable_match
+                # Consume immediately (synchronously, before the background task
+                # even starts) so a burst of several messages from the target
+                # can only ever match this bot message once — the reaction (or
+                # no-react decision) attaches to this single message only, never
+                # to subsequent ones.
+                self._mark_reactable_consumed(reactable_message_id)
+                task = asyncio.create_task(
+                    self._maybe_react_to_reply(message, trigger_content, replied_to_content)
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
 
         # ------------------------------------------------------------------
         # Determine mode without the lock (full re-check happens inside)

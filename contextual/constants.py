@@ -121,10 +121,14 @@ _MAX_REACTABLE_MESSAGES: int = 25
 # "the last message the bot sent" as the thing they're presumably answering.
 # This window bounds how stale that last message may be before we stop
 # treating an unrelated later message as a response to it.
-_REACTABLE_LOOKBACK_MINUTES: int = 30
+# Overridable via contextual_reminder.reactable_lookback_minutes in the
+# listener config; see ContextualReminder.__init__.
+_DEFAULT_REACTABLE_LOOKBACK_MINUTES: int = 30
 
 # How many messages of surrounding channel history to show the LLM when
 # deciding whether a reaction fits. Two isolated sentences (the bot's message
 # + the target's reply) can't reveal that the bot's message actually
 # interrupted an unrelated conversation — this gives it enough to notice.
-_REACTION_CONTEXT_LIMIT: int = 10
+# Overridable via contextual_reminder.reaction_context_limit in the listener
+# config; see ContextualReminder.__init__.
+_DEFAULT_REACTION_CONTEXT_LIMIT: int = 10

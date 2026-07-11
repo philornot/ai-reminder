@@ -35,3 +35,31 @@ contextual_reminder:
   # Maximum number of messages to include as conversation context.
   # Default: 20
   context_message_limit: 20
+
+  # Whether a direct ping (@bot, or a role the bot has) triggers an
+  # immediate reply, bypassing the time window, daily-sent state, and
+  # response cooldown. Set to false if you only want the scheduled and
+  # contextual reminders, never an on-demand reply to pings.
+  # Default: true
+  enable_mention_mode: true
+
+  # Master switch for the reply-reaction feature: the bot noticing when the
+  # target answers one of its own messages and deciding (via an extra LLM
+  # call) whether to add an emoji reaction. Set to false to skip that LLM
+  # call entirely and avoid needing the "Add Reactions" permission on
+  # Discord.
+  # Default: true
+  enable_reactions: true
+
+  # How stale the bot's last sent message may be (in minutes) before a
+  # target message that ISN'T an explicit Discord reply stops counting as a
+  # plausible response to it, for reply-reaction purposes. Only relevant
+  # when enable_reactions is true.
+  # Default: 30
+  reactable_lookback_minutes: 30
+
+  # How many surrounding channel messages to show the LLM when deciding
+  # whether a reaction fits the target's reply. Only relevant when
+  # enable_reactions is true.
+  # Default: 10
+  reaction_context_limit: 10

@@ -1,8 +1,16 @@
 """Reply-reaction feature: tracking reactable bot messages and deciding whether to react.
 
-``_ReactionMixin`` is mixed into ``ContextualReminder`` (see ``contextual.reminder``) and assumes the host
+Split out of ``contextual_reminder.py``. ``_ReactionMixin`` is mixed into
+``ContextualReminder`` (see ``contextual.reminder``) and assumes the host
 class provides ``self._cache``, ``self._ai_config``, ``self._llm``,
-``self.logger``, and ``self._reactable_messages_path``.
+``self.logger``, ``self._reactable_messages_path``,
+``self.reactable_lookback_minutes``, and ``self.reaction_context_limit``.
+
+The whole feature can be disabled deployment-wide via
+``contextual_reminder.enable_reactions`` in the listener config — see
+``ContextualReminder.__init__`` and ``handle_message()`` in
+``contextual.reminder``, which skips tracking/matching entirely when that
+flag is off.
 
 Whenever the target sends a message that's plausibly answering one of the
 bot's own sent messages (mention, contextual, or response-window) — either an
@@ -31,8 +39,6 @@ import discord
 
 from .constants import (
     _MAX_REACTABLE_MESSAGES,
-    _REACTABLE_LOOKBACK_MINUTES,
-    _REACTION_CONTEXT_LIMIT,
     _REACTION_EMOJI_CHOICES,
     _REACTION_EMOJI_MEANINGS,
 )
@@ -64,6 +70,9 @@ class _ReactionMixin:
             message_id: Discord snowflake ID of the message that was just sent.
             content: Text content of that message.
         """
+        if not self.enable_reactions:
+            return
+
         with self._cache.lock():
             try:
                 entries = self._read_reactable_messages()
@@ -114,7 +123,7 @@ class _ReactionMixin:
         Used as a fallback when the target's message isn't an explicit
         Discord reply: we still treat it as a plausible response to "whatever
         the bot last said", as long as that message is recent enough (see
-        ``_REACTABLE_LOOKBACK_MINUTES``) to make that a reasonable guess.
+        ``self.reactable_lookback_minutes``) to make that a reasonable guess.
 
         Entries already marked ``consumed`` are skipped — a single bot
         message may only be treated as "being answered" once, so that a
@@ -142,7 +151,7 @@ class _ReactionMixin:
             return None
 
         age = datetime.now(timezone.utc) - sent_at
-        if age > timedelta(minutes=_REACTABLE_LOOKBACK_MINUTES):
+        if age > timedelta(minutes=self.reactable_lookback_minutes):
             return None
 
         message_id = last_entry.get("message_id")
@@ -207,7 +216,7 @@ class _ReactionMixin:
                 self.logger.warning("Could not mark reactable message consumed: %s", exc)
 
     async def _fetch_recent_channel_messages(
-            self, trigger_message: discord.Message, limit: int = _REACTION_CONTEXT_LIMIT
+            self, trigger_message: discord.Message, limit: Optional[int] = None
     ) -> _ConversationContext:
         """Fetch the last few channel messages before trigger_message.
 
@@ -220,12 +229,17 @@ class _ReactionMixin:
 
         Args:
             trigger_message: The message to fetch history before.
-            limit: Maximum number of prior messages to fetch.
+            limit: Maximum number of prior messages to fetch. Defaults to
+                ``self.reaction_context_limit`` (config-overridable via
+                ``contextual_reminder.reaction_context_limit``) when omitted.
 
         Returns:
             A ``_ConversationContext`` with up to ``limit`` messages, oldest
             first, or an empty one if history couldn't be read.
         """
+        if limit is None:
+            limit = self.reaction_context_limit
+
         channel = trigger_message.channel
         collected: list[tuple[str, str]] = []
 
