@@ -29,7 +29,7 @@ import discord
 import yaml
 from discord.ext import commands, tasks
 
-from contextual_reminder import ContextualReminder
+from contextual import ContextualReminder
 
 
 # ---------------------------------------------------------------------------
