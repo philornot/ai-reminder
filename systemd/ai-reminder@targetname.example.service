@@ -1,0 +1,46 @@
+# Template unit for running multiple independent ai-reminder targets.
+#
+# "%i" is the instance name supplied after the "@" when you enable/start the
+# unit, and is substituted into ExecStart below to select the matching
+# per-target config file (config/config-%i.yaml).
+#
+# Setup:
+#   1. Copy this file to /etc/systemd/system/ai-reminder@.service
+#      (drop the ".example" suffix, keep the "@").
+#   2. Create one config file per target, e.g.:
+#        config/config-agnieszka.yaml
+#        config/config-marek.yaml
+#      Each is a full copy of config.example.yaml with its own
+#      discord.main_webhook_url, reminder.*, prompt.*, and — importantly —
+#      its own cache.cache_dir (e.g. "cache/agnieszka", "cache/marek") so
+#      that targets never share cache files.
+#   3. Reload systemd and enable one instance per target:
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable --now ai-reminder@agnieszka
+#        sudo systemctl enable --now ai-reminder@marek
+#   4. Check status/logs per instance:
+#        systemctl status ai-reminder@agnieszka
+#        journalctl -u ai-reminder@agnieszka -f
+#
+# Each instance is a fully separate process: if one target's process
+# crashes or hangs, the others keep running unaffected, and systemd
+# restarts only the failed instance (Restart=always).
+
+[Unit]
+Description=AI Reminder Service (target: %i)
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/ai-reminder
+ExecStart=/home/pi/ai-reminder/.venv/bin/python3 /home/pi/ai-reminder/main.py --config config/config-%i.yaml
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

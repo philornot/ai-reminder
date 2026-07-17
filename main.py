@@ -1,5 +1,6 @@
 """Main reminder application."""
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -387,10 +388,33 @@ class ReminderApp:
             raise
 
 
+def _parse_args() -> argparse.Namespace:
+    """Parse command-line arguments.
+
+    Returns:
+        Parsed arguments namespace with a ``config`` attribute.
+    """
+    parser = argparse.ArgumentParser(
+        description="AI Reminder — sends scheduled book-reminder messages.",
+    )
+    parser.add_argument(
+        "--config",
+        default="config/config.yaml",
+        help=(
+            "Path to the config YAML file (default: config/config.yaml). "
+            "Use this to run multiple independent targets, each with its "
+            "own config file (own cache_dir, webhook, etc.), e.g. "
+            "--config config/config-agnieszka.yaml"
+        ),
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     """Main entry point."""
+    args = _parse_args()
     try:
-        app = ReminderApp()
+        app = ReminderApp(config_path=args.config)
         app.run()
     except Exception as exc:
         print(f"Fatal error: {exc}")

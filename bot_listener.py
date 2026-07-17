@@ -1,29 +1,41 @@
 """Discord Listener Bot.
 
 Lightweight Discord bot that acts as the listener layer for ai-reminder.
-Its only job is to watch for messages from the configured target user and
-hand them off to ContextualReminder.
+Its only job is to watch for messages from one or more configured target
+users and hand each off to that target's own ``ContextualReminder``.
 
 What it does:
     * Connects to Discord with the Message Content privileged intent.
-    * On every guild message: delegates to ContextualReminder.handle_message().
-    * Registers the bot's own user with ContextualReminder on login so that
-      direct mention detection works correctly.
+    * On every guild message: delegates to ``ContextualReminder.handle_message()``
+      for every configured target (each target's own ``handle_message()``
+      already ignores messages that aren't from its ``target_discord_id``,
+      so routing "who should handle this message" needs no extra code here).
+    * Registers the bot's own user with every ``ContextualReminder`` on
+      login so that direct mention detection works correctly.
     * Stays invisible at all times (status refreshed every 60 s) while still
       listening and processing messages normally in the background.
     * Logs to both console and a rotating file (bot_listener.log).
 
 Configuration:
     Reads config_listener.yaml (copy config_listener.example.yaml and fill in):
-        discord_token       — bot token (needs Message Content intent enabled)
-        contextual_reminder — same block as in config.yaml; see that example
+        discord_token — bot token (needs Message Content intent enabled)
+        targets       — list of targets to watch. Each entry has:
+            name                — free-text label used only for log lines
+            contextual_reminder — same block that used to be top-level
+                                   (target_discord_id, ai_reminder_config,
+                                   channel_id, response_cooldown_minutes,
+                                   etc.) — see that example for details.
+
+    For backward compatibility, a config file that still has a top-level
+    ``contextual_reminder`` block (the old single-target format) is
+    automatically treated as a single-entry ``targets`` list named
+    "default" — no changes needed for existing single-target installs.
 """
 
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
 
 import discord
 import yaml
@@ -104,6 +116,39 @@ def _load_config() -> dict:
         sys.exit(1)
 
 
+def _resolve_target_entries(cfg: dict) -> list[dict]:
+    """Normalize config into a list of ``{"name": ..., "contextual_reminder": ...}``.
+
+    Supports the current multi-target ``targets:`` list format as well as
+    the legacy single-target format where ``contextual_reminder`` sits
+    directly at the top level of the config file.
+
+    Args:
+        cfg: Full parsed config_listener.yaml.
+
+    Returns:
+        A list of target entries, each with "name" and "contextual_reminder"
+        keys. Empty list if none are configured.
+    """
+    targets = cfg.get("targets")
+    if targets:
+        normalized = []
+        for i, entry in enumerate(targets):
+            name = entry.get("name") or f"target-{i + 1}"
+            normalized.append({
+                "name": name,
+                "contextual_reminder": entry.get("contextual_reminder", {}),
+            })
+        return normalized
+
+    # Legacy single-target format.
+    legacy_ctx = cfg.get("contextual_reminder")
+    if legacy_ctx:
+        return [{"name": "default", "contextual_reminder": legacy_ctx}]
+
+    return []
+
+
 cfg = _load_config()
 
 TOKEN: str = cfg.get("discord_token", "")
@@ -112,28 +157,57 @@ if not TOKEN:
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# ContextualReminder initialisation
+# ContextualReminder initialisation — one instance per target
 # ---------------------------------------------------------------------------
 
-contextual_reminder: Optional[ContextualReminder] = None
+_target_entries = _resolve_target_entries(cfg)
 
-_ctx_cfg = cfg.get("contextual_reminder", {})
-if not _ctx_cfg.get("enabled", False):
+if not _target_entries:
     logger.critical(
-        "contextual_reminder.enabled is false in %s — nothing to do. "
-        "Set it to true and configure the block.",
+        "No targets configured in %s — add a 'targets:' list (or the "
+        "legacy top-level 'contextual_reminder:' block) with at least one "
+        "enabled entry.",
         CONFIG_FILE,
     )
     sys.exit(1)
 
-try:
-    contextual_reminder = ContextualReminder(cfg, logger)
-    logger.info("ContextualReminder initialised successfully")
-except FileNotFoundError as exc:
-    logger.critical("ai-reminder config not found: %s", exc)
-    sys.exit(1)
-except Exception as exc:
-    logger.critical("Failed to initialise ContextualReminder: %s", exc, exc_info=True)
+# List of (name, ContextualReminder) pairs for every enabled target. A
+# target whose contextual_reminder.enabled is false is skipped entirely
+# (mirrors the previous single-target behaviour of exiting on disabled,
+# except now it just means "not watching this particular target").
+contextual_reminders: list[tuple[str, ContextualReminder]] = []
+
+for _entry in _target_entries:
+    _name = _entry["name"]
+    _ctx_cfg = _entry["contextual_reminder"]
+
+    if not _ctx_cfg.get("enabled", False):
+        logger.warning(
+            "Target '%s': contextual_reminder.enabled is false — skipping",
+            _name,
+        )
+        continue
+
+    try:
+        _reminder = ContextualReminder({"contextual_reminder": _ctx_cfg}, logger)
+        contextual_reminders.append((_name, _reminder))
+        logger.info("Target '%s': ContextualReminder initialised successfully", _name)
+    except FileNotFoundError as exc:
+        logger.critical("Target '%s': ai-reminder config not found: %s", _name, exc)
+        sys.exit(1)
+    except Exception as exc:
+        logger.critical(
+            "Target '%s': failed to initialise ContextualReminder: %s",
+            _name, exc, exc_info=True,
+        )
+        sys.exit(1)
+
+if not contextual_reminders:
+    logger.critical(
+        "All configured targets have contextual_reminder.enabled = false — "
+        "nothing to do. Enable at least one target in %s.",
+        CONFIG_FILE,
+    )
     sys.exit(1)
 
 
@@ -161,27 +235,39 @@ class ListenerBot(commands.Bot):
         and processing every message event); it just won't show any status to
         other Discord users.
 
-        Registering ``self.user`` with ``ContextualReminder`` is required so
-        that mention detection (``message.mentions`` check) can identify pings
-        directed at this specific bot account.
+        Registering ``self.user`` with every ``ContextualReminder`` is
+        required so that mention detection (``message.mentions`` check) can
+        identify pings directed at this specific bot account.
         """
         logger.info(
-            "Listener bot connected as %s (id=%d)",
+            "Listener bot connected as %s (id=%d) — watching %d target(s): %s",
             self.user, self.user.id,
+            len(contextual_reminders),
+            ", ".join(name for name, _ in contextual_reminders),
         )
         await self.change_presence(status=discord.Status.invisible)
 
-        if contextual_reminder is not None:
-            contextual_reminder.set_bot_user(self.user)
+        for _name, reminder in contextual_reminders:
+            reminder.set_bot_user(self.user)
 
     async def on_message(self, message: discord.Message) -> None:
-        """Forward every guild message to ContextualReminder.
+        """Forward every guild message to every configured target's handler.
+
+        Each ``ContextualReminder.handle_message()`` already checks
+        ``message.author.id`` against its own ``target_discord_id`` and
+        returns immediately for messages from anyone else, so it's safe to
+        offer every message to every target here.
 
         Args:
             message: Incoming Discord message event.
         """
-        if contextual_reminder is not None:
-            await contextual_reminder.handle_message(message)
+        for name, reminder in contextual_reminders:
+            try:
+                await reminder.handle_message(message)
+            except Exception:
+                logger.exception(
+                    "Target '%s': unhandled error in handle_message", name,
+                )
         await self.process_commands(message)
 
     async def on_error(self, event: str, *args, **kwargs) -> None:
@@ -226,6 +312,7 @@ if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info("Discord Listener Bot starting")
     logger.info("Config file : %s", CONFIG_FILE)
+    logger.info("Targets     : %s", ", ".join(name for name, _ in contextual_reminders))
     logger.info("Log rotation: 10 MB max, 5 backups")
     logger.info("=" * 60)
 

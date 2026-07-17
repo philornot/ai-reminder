@@ -1,10 +1,29 @@
 #!/usr/bin/env python3
-"""Utility script to inspect and repair the message cache."""
+"""Utility script to inspect and repair the message cache.
 
+Usage:
+    python tools/cache_utils.py [inspect|repair|clear]
+        [--config config/config.yaml | --cache-dir cache]
+
+By default the cache directory is resolved from config/config.yaml (same as
+the running app), so it works out of the box for both a single-target setup
+and multi-target setups where each target has its own config file and
+cache_dir. Pass --config to point at a specific target's config file, or
+--cache-dir to bypass config loading entirely and point directly at a cache
+directory, e.g.:
+
+    python tools/cache_utils.py inspect --config config/config-marek.yaml
+    python tools/cache_utils.py repair --cache-dir cache/agnieszka
+"""
+
+import argparse
 import json
 import sys
 from datetime import datetime
 from pathlib import Path
+
+# Allow running this script directly from the tools/ directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def load_cache(cache_path: Path):
@@ -225,20 +244,55 @@ def clear_cache(cache_path: Path):
     print(f"\n✓ Removed {count} messages")
 
 
-def main():
-    """Main entry point."""
-    cache_path = Path("../cache/messages.json")
+def _resolve_cache_dir(args: argparse.Namespace) -> Path:
+    """Resolve the cache directory from --cache-dir or --config.
 
-    if len(sys.argv) < 2:
-        print("Usage: python cache_utils.py [inspect|repair|clear]")
-        print()
-        print("Commands:")
-        print("  inspect - Show cache contents and statistics")
-        print("  repair  - Remove invalid entries and duplicates")
-        print("  clear   - Remove all messages from cache")
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        Resolved cache directory path.
+    """
+    if args.cache_dir:
+        return Path(args.cache_dir)
+
+    from config_loader import Config  # noqa: E402
+
+    try:
+        config = Config(args.config)
+    except Exception as exc:
+        print(f"❌ Could not load config '{args.config}': {exc}")
         sys.exit(1)
 
-    command = sys.argv[1].lower()
+    return Path(config.cache_dir)
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "command",
+        choices=["inspect", "repair", "clear"],
+        help="Command to run",
+    )
+    parser.add_argument(
+        "--config",
+        default="config/config.yaml",
+        help="Path to config.yaml to resolve the cache dir from "
+             "(default: config/config.yaml). Ignored if --cache-dir is given.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Cache directory to operate on directly (skips config loading). "
+             "E.g. --cache-dir cache/agnieszka",
+    )
+    args = parser.parse_args()
+
+    cache_dir = _resolve_cache_dir(args)
+    cache_path = cache_dir / "messages.json"
+
+    command = args.command.lower()
 
     if command == "inspect":
         inspect_cache(cache_path)

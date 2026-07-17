@@ -8,58 +8,88 @@
 #   Bot -> Privileged Gateway Intents -> Message Content Intent
 discord_token: "YOUR_LISTENER_BOT_TOKEN_HERE"
 
-# Contextual book reminder — sends a witty reply to the target user's Discord
-# messages that sneaks in a book reminder. Powered by the ai-reminder project
-# running on the same host.
-contextual_reminder:
-  enabled: true
+# One Discord bot/token can watch several targets at once. Each entry in
+# "targets" below spins up its own ContextualReminder instance (its own
+# Config/LLMClient/DiscordWebhook/CacheManager, exactly as if it were a
+# separate bot) — but they all share the single Discord connection/token
+# configured above. Every incoming message is checked against every target;
+# each target's own target_discord_id decides whether it's the one that
+# should react.
+#
+# For a single-target setup, just keep one entry in the list.
+targets:
+  - # Free-text name used only for logging, so you can tell targets apart
+    # in the console/log output.
+    name: "agnieszka"
 
-  # Path to ai-reminder's config.yaml.
-  # Relative to the directory you run bot_listener.py from.
-  ai_reminder_config: "config/config.yaml"
+    contextual_reminder:
+      enabled: true
 
-  # Discord user ID of the person to watch.
-  # How to find it: enable Developer Mode in Discord
-  # (Settings -> Advanced -> Developer Mode),
-  # then right-click the user -> Copy User ID.
-  target_discord_id: 123456789012345678
+      # Path to this target's ai-reminder config.yaml (its own cache_dir,
+      # webhook, prompt, etc.). Relative to the directory you run
+      # bot_listener.py from.
+      ai_reminder_config: "config/config-agnieszka.yaml"
 
-  # Restrict monitoring to a single channel (null = all channels).
-  channel_id: null
+      # Discord user ID of the person to watch.
+      # How to find it: enable Developer Mode in Discord
+      # (Settings -> Advanced -> Developer Mode),
+      # then right-click the user -> Copy User ID.
+      target_discord_id: 123456789012345678
 
-  # Minimum gap (minutes) between two response-window replies in the same
-  # window. Prevents flooding when the target sends several messages in a row.
-  # Default: 30
-  response_cooldown_minutes: 30
+      # Restrict monitoring to a single channel (null = all channels).
+      channel_id: null
 
-  # Maximum number of messages to include as conversation context.
-  # Default: 20
-  context_message_limit: 20
+      # Minimum gap (minutes) between two response-window replies in the
+      # same window. Prevents flooding when the target sends several
+      # messages in a row.
+      # Default: 30
+      response_cooldown_minutes: 30
 
-  # Whether a direct ping (@bot, or a role the bot has) triggers an
-  # immediate reply, bypassing the time window, daily-sent state, and
-  # response cooldown. Set to false if you only want the scheduled and
-  # contextual reminders, never an on-demand reply to pings.
-  # Default: true
-  enable_mention_mode: true
+      # Maximum number of messages to include as conversation context.
+      # Default: 20
+      context_message_limit: 20
 
-  # Master switch for the reply-reaction feature: the bot noticing when the
-  # target answers one of its own messages and deciding (via an extra LLM
-  # call) whether to add an emoji reaction. Set to false to skip that LLM
-  # call entirely and avoid needing the "Add Reactions" permission on
-  # Discord.
-  # Default: true
-  enable_reactions: true
+      # Whether a direct ping (@bot, or a role the bot has) triggers an
+      # immediate reply, bypassing the time window, daily-sent state, and
+      # response cooldown. Set to false if you only want the scheduled and
+      # contextual reminders, never an on-demand reply to pings.
+      # Default: true
+      enable_mention_mode: true
 
-  # How stale the bot's last sent message may be (in minutes) before a
-  # target message that ISN'T an explicit Discord reply stops counting as a
-  # plausible response to it, for reply-reaction purposes. Only relevant
-  # when enable_reactions is true.
-  # Default: 30
-  reactable_lookback_minutes: 30
+      # Master switch for the reply-reaction feature: the bot noticing when
+      # the target answers one of its own messages and deciding (via an
+      # extra LLM call) whether to add an emoji reaction. Set to false to
+      # skip that LLM call entirely and avoid needing the "Add Reactions"
+      # permission on Discord.
+      # Default: true
+      enable_reactions: true
 
-  # How many surrounding channel messages to show the LLM when deciding
-  # whether a reaction fits the target's reply. Only relevant when
-  # enable_reactions is true.
-  # Default: 10
-  reaction_context_limit: 10
+      # How stale the bot's last sent message may be (in minutes) before a
+      # target message that ISN'T an explicit Discord reply stops counting
+      # as a plausible response to it, for reply-reaction purposes. Only
+      # relevant when enable_reactions is true.
+      # Default: 30
+      reactable_lookback_minutes: 30
+
+      # How many surrounding channel messages to show the LLM when
+      # deciding whether a reaction fits the target's reply. Only relevant
+      # when enable_reactions is true.
+      # Default: 10
+      reaction_context_limit: 10
+
+  # Second target example — copy this block for every additional person you
+  # want the same bot to watch. Remember each needs its own
+  # ai_reminder_config pointing at a config file with its own cache_dir.
+  - name: "marek"
+
+    contextual_reminder:
+      enabled: true
+      ai_reminder_config: "config/config-marek.yaml"
+      target_discord_id: 987654321098765432
+      channel_id: null
+      response_cooldown_minutes: 30
+      context_message_limit: 20
+      enable_mention_mode: true
+      enable_reactions: true
+      reactable_lookback_minutes: 30
+      reaction_context_limit: 10

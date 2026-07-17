@@ -1,10 +1,25 @@
 #!/usr/bin/env python3
-"""Script to clean up malformed messages in cache."""
+"""Script to clean up malformed messages in cache.
 
+Usage:
+    python tools/fix_cache.py [--config config/config.yaml | --cache-dir cache]
+
+By default this resolves the cache directory from config/config.yaml (same
+as the running app), so it works out of the box for both a single-target
+setup and multi-target setups where each target has its own config file and
+cache_dir. Pass --config to point at a specific target's config file, or
+--cache-dir to bypass config loading entirely and point directly at a cache
+directory.
+"""
+
+import argparse
 import json
 import sys
 from pathlib import Path
 import re
+
+# Allow running this script directly from the tools/ directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def clean_message(message: str) -> str:
@@ -67,9 +82,48 @@ def clean_message(message: str) -> str:
     return cleaned.strip()
 
 
+def _resolve_cache_dir(args: argparse.Namespace) -> Path:
+    """Resolve the cache directory from --cache-dir or --config.
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        Resolved cache directory path.
+    """
+    if args.cache_dir:
+        return Path(args.cache_dir)
+
+    from config_loader import Config  # noqa: E402
+
+    try:
+        config = Config(args.config)
+    except Exception as exc:
+        print(f"❌ Could not load config '{args.config}': {exc}")
+        sys.exit(1)
+
+    return Path(config.cache_dir)
+
+
 def main():
     """Main entry point."""
-    cache_path = Path("../cache/messages.json")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        default="config/config.yaml",
+        help="Path to config.yaml to resolve the cache dir from "
+             "(default: config/config.yaml). Ignored if --cache-dir is given.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Cache directory to operate on directly (skips config loading). "
+             "E.g. --cache-dir cache/agnieszka",
+    )
+    args = parser.parse_args()
+
+    cache_dir = _resolve_cache_dir(args)
+    cache_path = cache_dir / "messages.json"
 
     if not cache_path.exists():
         print(f"❌ Cache file not found: {cache_path}")
