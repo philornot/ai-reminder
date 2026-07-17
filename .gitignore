@@ -5,7 +5,7 @@
 /.idea
 /__pycache__
 
-config/config.yaml
+config/config-*.yaml
 config/config_listener.yaml
 
 systemd/ai-reminder.service
